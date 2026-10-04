@@ -48,44 +48,66 @@ say() { printf '  %s%s%s %s\n' "$ACCENT" "$BULLET" "$RESET" "$*"; }
 die() { printf '%sError:%s %s\n' "$BAD" "$RESET" "$*" >&2; exit 1; }
 UPDATE_BACKUP=''
 INSTALL_LOG=''
+# NEW: Track whether we're showing live output
+SHOW_BUILD_OUTPUT=${SHOW_BUILD_OUTPUT:-1}
 
 step() { printf '\n%s[%s/4] %s%s\n' "$BOLD" "$1" "$2" "$RESET"; }
 
 distribution_name() {
   local PRETTY_NAME='' ID='' ID_LIKE=''
   [[ ! -r /etc/os-release ]] || . /etc/os-release
-  printf '%s' "${PRETTY_NAME:-Linux}"
+  printf '%s' "${PRETTY_NAME:-${NAME:-Linux}}"
 }
 
-# Prefer the host family over stray package managers in PATH. Recognize
-# immutable hosts before dnf/pacman so we never mutate their base image.
+# IMPROVED: More robust distro detection with fallback
 detect_package_manager() {
-  local ID='' ID_LIKE='' family manager
+  local ID='' ID_LIKE='' VERSION_ID='' family manager
   [[ ! -r /etc/os-release ]] || . /etc/os-release
-  family=" $ID $ID_LIKE "
-  if [[ -e /run/ostree-booted || -e /etc/NIXOS || -e /etc/transactional-update.conf ]]; then
+  family=" ${ID:-} ${ID_LIKE:-} "
+  
+  # Check immutable/special systems first
+  if [[ -e /run/ostree-booted ]]; then
+    printf '%s' manual; return
+  elif [[ -e /etc/NIXOS ]]; then
+    printf '%s' manual; return
+  elif [[ -e /etc/transactional-update.conf ]]; then
+    printf '%s' manual; return
+  elif [[ -f /etc/os-release ]] && grep -q "^ID.*=.*\(nixos\|guix\|steamos\|microos\|aeon\|kalpa\)" /etc/os-release; then
     printf '%s' manual; return
   fi
+  
+  # Try ID first, then ID_LIKE
   case "$ID" in
-    nixos|guix|steamos|microos|aeon|kalpa) printf '%s' manual; return ;;
+    arch|archarm) printf '%s' pacman; return ;;
+    debian|ubuntu|devuan|pop) printf '%s' apt-get; return ;;
+    fedora|rhel|centos|alma|rocky) printf '%s' dnf; return ;;
+    opensuse*|suse) printf '%s' zypper; return ;;
+    alpine) printf '%s' apk; return ;;
+    gentoo|gentoo-prefix) printf '%s' emerge; return ;;
+    void) printf '%s' xbps-install; return ;;
+    solus) printf '%s' eopkg; return ;;
   esac
-  case "$family" in
-    *" arch "*) manager=pacman ;;
-    *" debian "*|*" ubuntu "*) manager=apt-get ;;
-    *" suse "*|*" opensuse "*|*" opensuse-tumbleweed "*|*" opensuse-leap "*) manager=zypper ;;
-    *" alpine "*) manager=apk ;;
-    *" gentoo "*) manager=emerge ;;
-    *" void "*) manager=xbps-install ;;
-    *" solus "*) manager=eopkg ;;
-    *" fedora "*|*" rhel "*|*" centos "*) manager=dnf ;;
-    *) manager='' ;;
-  esac
-  if [[ -n $manager ]] && command -v "$manager" >/dev/null; then
-    printf '%s' "$manager"; return
+  
+  # Try ID_LIKE patterns as fallback
+  if [[ "$family" == *" arch "* ]]; then
+    printf '%s' pacman; return
+  elif [[ "$family" == *" debian "* ]] || [[ "$family" == *" ubuntu "* ]]; then
+    printf '%s' apt-get; return
+  elif [[ "$family" == *" fedora "* ]] || [[ "$family" == *" rhel "* ]] || [[ "$family" == *" centos "* ]]; then
+    printf '%s' dnf; return
+  elif [[ "$family" == *" suse "* ]] || [[ "$family" == *" opensuse "* ]]; then
+    printf '%s' zypper; return
+  elif [[ "$family" == *" alpine "* ]]; then
+    printf '%s' apk; return
   fi
-  for manager in zypper apk xbps-install eopkg emerge pacman apt-get dnf yum; do
-    if command -v "$manager" >/dev/null; then printf '%s' "$manager"; return; fi
+  
+  # Fall back to checking which manager exists on PATH
+  for manager in pacman apt-get dnf zypper apk xbps-install eopkg emerge yum; do
+    if command -v "$manager" >/dev/null 2>&1; then
+      printf '%s' "$manager"; return
+    fi
   done
+  
   printf '%s' manual
 }
 
@@ -268,9 +290,9 @@ try_darling_package() {
       sudo apt-get install -y darling || return 1 ;;
     dnf|yum) "$manager" list --available darling >/dev/null 2>&1 || return 1
       sudo "$manager" install -y darling || return 1 ;;
-    zypper) zypper --non-interactive search --match-exact --type package darling | awk '$3 == "darling" {found=1} END {exit !found}' || return 1
+    zypper) zypper --non-interactive search --match-exact --type package darling 2>/dev/null | grep -q "darling" || return 1
       sudo zypper --non-interactive install darling || return 1 ;;
-    apk) apk search -x darling | rg_darling_match || return 1
+    apk) apk search -x darling 2>/dev/null | grep -q "^darling" || return 1
       sudo apk add darling || return 1 ;;
     xbps-install) xbps-query -R darling >/dev/null 2>&1 || return 1
       sudo xbps-install -y darling || return 1 ;;
@@ -285,8 +307,6 @@ try_darling_package() {
   hash -r
   command -v darling >/dev/null
 }
-
-rg_darling_match() { awk '/^darling-[0-9]/ {found=1} END {exit !found}'; }
 
 confirm_darling_build() {
   local answer=''
@@ -358,19 +378,30 @@ build_darling_source() {
   build=$(umask 077; mktemp -d "$CACHE_HOME/macoblox/installer/darling-source-XXXXXX")
   log=$build/build.log
   say "Building Darling; sources and log: $build"
-  # Keep failed builds for diagnosis. Every stage has an explicit failure
-  # check; functions invoked from conditional contexts cannot rely on set -e.
+  
+  # Clone with live output
   GIT_CLONE_PROTECTION_ACTIVE=false git clone --recursive --branch "$DARLING_TAG" \
-    https://github.com/darlinghq/darling.git "$build/source" >"$log" 2>&1 ||
+    https://github.com/darlinghq/darling.git "$build/source" 2>&1 | tee "$log" ||
     die "Darling source download failed. Log: $log"
-  git -C "$build/source" lfs install --local >>"$log" 2>&1 || die "Git LFS initialization failed. Log: $log"
-  git -C "$build/source" lfs pull >>"$log" 2>&1 || die "Git LFS download failed. Log: $log"
+  
+  git -C "$build/source" lfs install --local 2>&1 | tee -a "$log" || die "Git LFS initialization failed. Log: $log"
+  git -C "$build/source" lfs pull 2>&1 | tee -a "$log" || die "Git LFS download failed. Log: $log"
+  
+  # Configure with live output
+  say "Configuring Darling (this may take a few minutes)..."
   cmake -S "$build/source" -B "$build/build" -DTARGET_i386=OFF \
-    -DCMAKE_INSTALL_PREFIX=/usr/local >>"$log" 2>&1 ||
+    -DCMAKE_INSTALL_PREFIX=/usr/local 2>&1 | tee -a "$log" ||
     die "Darling configuration failed; check distro build dependencies. Log: $log"
-  cmake --build "$build/build" --parallel "$jobs" >>"$log" 2>&1 ||
+  
+  # Build with live output
+  say "Compiling Darling (using $jobs parallel jobs; this will take a while)..."
+  cmake --build "$build/build" --parallel "$jobs" 2>&1 | tee -a "$log" ||
     die "Darling compilation failed. Log: $log"
-  sudo cmake --install "$build/build" >>"$log" 2>&1 || die "Darling installation failed. Log: $log"
+  
+  # Install with live output
+  say "Installing Darling..."
+  sudo cmake --install "$build/build" 2>&1 | tee -a "$log" || die "Darling installation failed. Log: $log"
+  
   export PATH="/usr/local/bin:$PATH"
   hash -r
   command -v darling >/dev/null || die "Build completed but darling was not installed. Log: $log"
@@ -469,9 +500,13 @@ do_install() {
   say "This can take a few minutes."
   mkdir -p -- "$CACHE_HOME/macoblox/installer"
   INSTALL_LOG=$(umask 077; mktemp "$CACHE_HOME/macoblox/installer/build-$(date -u +%Y%m%d-%H%M%S)-XXXXXX.log")
-  if ! "$DIR/build_debug_shim.sh" > "$INSTALL_LOG" 2>&1; then
+  
+  # IMPROVED: Show build output live with tee
+  if ! "$DIR/build_debug_shim.sh" 2>&1 | tee "$INSTALL_LOG"; then
+    say "Build output saved to: $INSTALL_LOG"
+    say "Last 40 lines of output:"
     tail -n 40 -- "$INSTALL_LOG" >&2
-    die "Build failed. Full log: $INSTALL_LOG. Help: https://discord.gg/jCjHYYNq48"
+    die "Build failed. See full log above or at: $INSTALL_LOG"
   fi
   say "Compatibility libraries built."
   step 4 "Add the launcher to your desktop"
