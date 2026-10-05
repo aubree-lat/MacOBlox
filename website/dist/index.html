@@ -4,16 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#000000">
-  <meta name="description" content="Mac O’ Blox brings the macOS Roblox client to Linux through Darling. Free, open source, and made for your desktop.">
-  <meta property="og:title" content="Mac O’ Blox — Roblox on Linux">
-  <meta property="og:description" content="The macOS Roblox client, running on your Linux desktop through Darling.">
+  <meta name="description" content="MacOBlox brings the macOS Roblox client to Linux through Darling. Free, open source">
+  <meta property="og:title" content="MacOBlox — Roblox on Linux">
+  <meta property="og:description" content="it runs on darling, and ITS FREE!!! (like that roblox slogan)">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://macoblox.aubree.wtf/">
   <link rel="canonical" href="https://macoblox.aubree.wtf/">
   <link rel="icon" href="assets/favicon.png" type="image/png">
   <link rel="preload" href="assets/fonts/Archivo.ttf" as="font" type="font/ttf" crossorigin>
   <link rel="stylesheet" href="style.css">
-  <title>Mac O’ Blox — Roblox on Linux</title>
+  <title>MacOBlox — Roblox on Linux</title>
   <script src="assets/vendor/p5.min.js" defer></script>
   <script src="assets/vendor/vanta.topology.min.js" defer></script>
   <script src="background.js" defer></script>
@@ -21,18 +21,16 @@
 </head>
 <body>
   <div id="wallpaper" aria-hidden="true"></div>
-  <a class="skip-link" href="#main">Skip to content</a>
-
   <main id="main" class="desktop">
     <section class="window" id="about" aria-labelledby="about-title">
       <header class="window-bar"><span>about</span><a href="https://github.com/aubree-lat/MacOBlox/releases/latest">latest release</a></header>
       <div class="window-body">
         <img class="wordmark" src="assets/wordmark.png" width="1200" height="286" alt="Mac O’ Blox">
-        <h1 id="about-title">Roblox on Linux.</h1>
+        <h1 id="about-title">MacOS Roblox Client, but on Linux. :3</h1>
         <p>The macOS Roblox client, running on your Linux desktop through Darling.</p>
-        <div class="tags"><span>free &amp; open source</span><span>English / Russian</span></div>
+        <div class="tags"><span>free &amp; open source</span></div>
         <ul class="feature-list">
-          <li>actually functional</li>
+          <li>runs on darling with some improvements</li>
           <li>basic functionality</li>
           <li>fastflags, mods, and more</li>
           <li>roblox studio runs on wine itself</li>
@@ -54,16 +52,14 @@
     <section class="window" id="install" aria-labelledby="install-title">
       <header class="window-bar"><h2 id="install-title">install</h2><a href="https://github.com/aubree-lat/MacOBlox#install">guide</a></header>
       <div class="window-body">
-        <p>Run this in your terminal. The installer guides you through setup and prepares Roblox.</p>
+        <p>you paste this in your terminal and you run it, so simple right?</p>
         <div class="command-box"><code id="install-command">curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash</code></div>
         <div class="install-actions">
-          <button class="button" id="copy-command" type="button" aria-label="Copy installation command" hidden>Copy command</button>
-          <a class="button" href="https://github.com/aubree-lat/MacOBlox/releases/download/v0.19/MacOBlox-0.19-x86_64.flatpak">Download Flatpak</a>
+          <button class="button" id="copy-command" type="button" aria-label="Copy installation command" hidden>copy</button>
         </div>
         <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
-        <p class="install-note">Run the installer again to update. Your settings and sign-in stay in place. The Flatpak is a testing build without Studio.</p>
+        <p class="install-note">you run the script again and it updates, your sign in and settings will stay in place, so no need to do allat again </p>
         <div class="small-links">
-          <a href="https://github.com/aubree-lat/MacOBlox/releases/download/v0.19/SHA256SUMS">Flatpak checksum</a>
           <a href="https://github.com/aubree-lat/MacOBlox/releases">All releases</a>
         </div>
       </div>
