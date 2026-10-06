@@ -13,17 +13,23 @@ import json
 import os
 import socket
 import urllib.parse
+from collections import deque
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from . import core  # noqa: E402
 from .i18n import _  # noqa: E402
 
 GUEST_PREFIX = "/Volumes/SystemRoot"  # the host filesystem as the game sees it
+MAX_FRAME_BYTES = 1024 * 1024
+MAX_QUEUE_BYTES = 2 * MAX_FRAME_BYTES
+MAX_PENDING = 128
+IO_BYTES_PER_TURN = 64 * 1024
+IO_MESSAGES_PER_TURN = 32
 
 
 def _webkit():
@@ -78,11 +84,16 @@ def _header_ok(name, value):
 
 
 class _Page:
-    def __init__(self, page_id, view):
+    def __init__(self, page_id, view, generation):
         self.id = page_id
         self.view = view
         self.delegate = False
         self.panel_title = ""
+        self.generation = generation
+        self.signals = []
+        self.handlers = set()
+        self.scripts = set()
+        self.script_bytes = 0
 
 
 class WebBridge:
@@ -114,8 +125,16 @@ class WebBridge:
         self.peer = None
         self.peer_watch = 0
         self.write_watch = 0
-        self.received = b""
-        self.outgoing = []
+        self.received = bytearray()
+        self.outgoing = deque()
+        self.outgoing_bytes = 0
+        self.incoming_idle = 0
+        self.flush_idle = 0
+        self.read_closed = False
+        self.generation = 0
+        self.stopped = False
+        self.async_serial = 0
+        self.pending_async = {}
         self.pages = {}
         self.decisions = {}
         self.decision_id = 0
@@ -125,9 +144,9 @@ class WebBridge:
 
     # ---------------------------------------------------------------- socket
     def stop(self):
-        for page in self.pages.values():
-            if page.view:
-                page.view.stop_loading()
+        if self.stopped:
+            return
+        self.stopped = True
         self._drop_peer()
         if self.listen_watch:
             GLib.source_remove(self.listen_watch)
@@ -140,8 +159,11 @@ class WebBridge:
         if self.window:
             self.window.destroy()
             self.window = None
+        self.session = None
 
     def _accept(self, _fd, _condition):
+        if self.stopped:
+            return False
         try:
             client, _address = self.listener.accept()
         except OSError:
@@ -150,17 +172,23 @@ class WebBridge:
             client.close()  # one game at a time
             return True
         client.setblocking(False)
+        self.generation += 1
         self.peer = client
-        self.received = b""
+        self.received.clear()
+        self.read_closed = False
         self.peer_watch = GLib.io_add_watch(client.fileno(), GLib.PRIORITY_DEFAULT,
                                             GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
                                             self._incoming)
         return True
 
     def _drop_peer(self):
-        for decision in self.decisions.values():
-            decision.ignore()
-        self.decisions.clear()
+        self.generation += 1
+        if self.incoming_idle:
+            GLib.source_remove(self.incoming_idle)
+            self.incoming_idle = 0
+        if self.flush_idle:
+            GLib.source_remove(self.flush_idle)
+            self.flush_idle = 0
         if self.peer_watch:
             GLib.source_remove(self.peer_watch)
             self.peer_watch = 0
@@ -170,61 +198,123 @@ class WebBridge:
         if self.peer:
             self.peer.close()
             self.peer = None
-        self.received = b""
-        self.outgoing = []
+        self.received.clear()
+        self.outgoing.clear()
+        self.outgoing_bytes = 0
+        self.read_closed = False
+        for number in list(self.decisions):
+            self._resolve_decision(number, False)
+        for token, (cancellable, _page, _generation) in list(self.pending_async.items()):
+            self.pending_async.pop(token, None)
+            cancellable.cancel()
+        for page in list(self.pages.values()):
+            self._close_page(page)
+        self.current = None
+        if self.window:
+            self.window.set_visible(False)
 
-    def _incoming(self, _fd, condition):
+    def _incoming(self, _fd, _condition):
         if self.peer is None:
             return False
-        closed = bool(condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR))
+        generation = self.generation
+        remaining = IO_BYTES_PER_TURN
         try:
-            while True:
-                chunk = self.peer.recv(8192)
+            while remaining > 0:
+                chunk = self.peer.recv(min(8192, remaining))
                 if not chunk:
-                    closed = True
+                    self.read_closed = True
                     break
                 self.received += chunk
-                if len(self.received) > 1024 * 1024:
-                    closed = True
-                    break
+                remaining -= len(chunk)
+                if len(self.received) > MAX_QUEUE_BYTES:
+                    self._drop_peer()
+                    return False
         except BlockingIOError:
             pass
         except OSError:
-            closed = True
-        while b"\n" in self.received:
-            line, self.received = self.received.split(b"\n", 1)
+            self.read_closed = True
+        more = self._process_incoming(generation)
+        if generation != self.generation or not self.peer:
+            return False
+        if not more and self.read_closed:
+            self._drop_peer()
+            return False
+        # Rearm only through an idle turn. A continuously readable descriptor
+        # at the default priority must still give GTK's redraw sources a turn.
+        self.peer_watch = 0
+        self._schedule_incoming(generation)
+        return False
+
+    def _process_incoming(self, generation):
+        for _index in range(IO_MESSAGES_PER_TURN):
+            end = self.received.find(b"\n")
+            if end < 0:
+                if len(self.received) > MAX_FRAME_BYTES:
+                    self._drop_peer()
+                return False
+            if end + 1 > MAX_FRAME_BYTES:
+                self._drop_peer()
+                return False
+            line = self.received[:end]
+            del self.received[:end + 1]
             try:
                 message = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(message, dict):
                 try:
                     self._handle(message)
                 except Exception as error:  # one bad request must not end the bridge
-                    print("Embedded web page request failed:", error)
+                    print("Embedded web page request failed:", type(error).__name__)
                     self._reply_error(message.get("request"), "The embedded browser request failed")
-        if closed:
-            self._drop_peer()
-            return False
-        return True
+            if generation != self.generation or not self.peer:
+                return False
+        return b"\n" in self.received
 
-    def send(self, message):
-        if not self.peer:
+    def _schedule_incoming(self, generation):
+        if not self.incoming_idle:
+            self.incoming_idle = GLib.idle_add(self._continue_incoming, generation)
+
+    def _continue_incoming(self, generation):
+        self.incoming_idle = 0
+        if generation != self.generation or not self.peer:
+            return False
+        if self._process_incoming(generation):
+            self._schedule_incoming(generation)
+        elif generation == self.generation and self.read_closed:
+            self._drop_peer()
+        elif generation == self.generation and self.peer and not self.peer_watch:
+            self.peer_watch = GLib.io_add_watch(
+                self.peer.fileno(), GLib.PRIORITY_DEFAULT,
+                GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, self._incoming)
+        return False
+
+    def send(self, message, generation=None):
+        if not self.peer or (generation is not None and generation != self.generation):
             return
-        if len(self.outgoing) >= 128:
+        try:
+            frame = json.dumps(message, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+        except (TypeError, ValueError, RecursionError):
+            self._drop_peer()
+            return
+        if (len(frame) > MAX_FRAME_BYTES or len(self.outgoing) >= MAX_PENDING
+                or self.outgoing_bytes + len(frame) > MAX_QUEUE_BYTES):
             # Closing the stream lets the guest finish pending callbacks with
             # an error. Silently dropping a reply leaves them waiting forever.
             self._drop_peer()
             return
-        self.outgoing.append(json.dumps(message).encode() + b"\n")
-        if not self.write_watch:
+        self.outgoing.append(frame)
+        self.outgoing_bytes += len(frame)
+        if not self.write_watch and not self.flush_idle:
             self.write_watch = GLib.io_add_watch(self.peer.fileno(), GLib.PRIORITY_DEFAULT,
                                                  GLib.IOCondition.OUT, self._flush)
 
     def _flush(self, _fd, _condition):
-        while self.outgoing and self.peer:
+        remaining = IO_BYTES_PER_TURN
+        messages = IO_MESSAGES_PER_TURN
+        while self.outgoing and self.peer and remaining > 0 and messages > 0:
             try:
-                sent = self.peer.send(self.outgoing[0])
+                sent = self.peer.send(self.outgoing[0][:remaining])
             except BlockingIOError:
                 return True
             except OSError:
@@ -234,15 +324,60 @@ class WebBridge:
                 self._drop_peer()
                 return False
             self.outgoing[0] = self.outgoing[0][sent:]
+            self.outgoing_bytes -= sent
+            remaining -= sent
             if not self.outgoing[0]:
-                self.outgoing.pop(0)
+                self.outgoing.popleft()
+                messages -= 1
+        if self.outgoing and self.peer:
+            self.write_watch = 0
+            self.flush_idle = GLib.idle_add(self._continue_flush, self.generation)
+            return False
         self.write_watch = 0
         return False
 
+    def _continue_flush(self, generation):
+        self.flush_idle = 0
+        if generation == self.generation and self.peer and self.outgoing and not self.write_watch:
+            self.write_watch = GLib.io_add_watch(self.peer.fileno(), GLib.PRIORITY_DEFAULT,
+                                               GLib.IOCondition.OUT, self._flush)
+        return False
+
     def _event(self, page, kind, **fields):
+        if page and not self._active_page(page):
+            return
         message = {"view": page.id if page else 0, "event": kind}
         message.update(fields)
         self.send(message)
+
+    def _active_page(self, page):
+        return (self.peer is not None and page.view is not None
+                and page.generation == self.generation and self.pages.get(page.id) is page)
+
+    def _begin_async(self, number, page=None):
+        if not self.peer or (page and not self._active_page(page)):
+            return None
+        if len(self.pending_async) >= MAX_PENDING:
+            self._reply_error(number, "Too many pending browser requests", page.id if page else 0)
+            return None
+        self.async_serial += 1
+        token = self.async_serial
+        cancellable = Gio.Cancellable.new()
+        self.pending_async[token] = (cancellable, page, self.generation)
+        return token, cancellable
+
+    def _finish_async(self, token, reply):
+        job = self.pending_async.pop(token, None)
+        if not job:
+            return
+        _cancellable, page, generation = job
+        if not page or self._active_page(page):
+            self.send(reply, generation)
+
+    def _abort_async(self, token):
+        job = self.pending_async.pop(token, None)
+        if job:
+            job[0].cancel()
 
     def _reply_error(self, number, reason, page_id=0):
         if isinstance(number, int) and not isinstance(number, bool):
@@ -310,23 +445,58 @@ class WebBridge:
     def _page(self, page_id):
         if page_id in self.pages:
             return self.pages[page_id]
+        if len(self.pages) >= 32:
+            return None
         WebKit = self.WebKit
         if not self.window:
             self._build_window()
         manager = WebKit.UserContentManager()
         view = WebKit.WebView(network_session=self.session, user_content_manager=manager)
-        page = _Page(page_id, view)
+        page = _Page(page_id, view, self.generation)
         self.pages[page_id] = page
         self.stack.add_named(view, str(page_id))
-        view.connect("load-changed", self._load_changed, page)
-        view.connect("load-failed", self._load_failed, page)
-        view.connect("web-process-terminated", self._terminated, page)
-        view.connect("notify::title", self._state, page)
-        view.connect("notify::uri", self._state, page)
-        view.connect("decide-policy", self._policy, page)
+        for signal, callback in (("load-changed", self._load_changed),
+                                 ("load-failed", self._load_failed),
+                                 ("web-process-terminated", self._terminated),
+                                 ("notify::title", self._state), ("notify::uri", self._state),
+                                 ("decide-policy", self._policy)):
+            page.signals.append((view, view.connect(signal, callback, page)))
         return page
 
+    def _close_page(self, page):
+        if self.pages.get(page.id) is not page:
+            return
+        self.pages.pop(page.id)
+        if self.current is page:
+            self.current = None
+            if self.window:
+                self.window.set_visible(False)
+        for number, (_decision, owner, _source) in list(self.decisions.items()):
+            if owner is page:
+                self._resolve_decision(number, False)
+        for token, (cancellable, owner, _generation) in list(self.pending_async.items()):
+            if owner is page:
+                self.pending_async.pop(token, None)
+                cancellable.cancel()
+        view = page.view
+        page.view = None  # invalidate callbacks before stopping the load
+        for source, handler in page.signals:
+            source.disconnect(handler)
+        page.signals.clear()
+        if view:
+            manager = view.get_user_content_manager()
+            for name in page.handlers:
+                manager.unregister_script_message_handler(name, None)
+            manager.remove_all_scripts()
+            view.stop_loading()
+            self.stack.remove(view)
+        page.handlers.clear()
+        page.scripts.clear()
+        page.script_bytes = 0
+
     def _state(self, view, _pspec, page):
+        if not self._active_page(page):
+            return
         self._event(page, "state", url=view.get_uri() or "", title=view.get_title() or "",
                     back=view.can_go_back(), forward=view.can_go_forward(), loading=view.is_loading())
         if self.current is page:
@@ -345,6 +515,9 @@ class WebBridge:
         self._event(page, "error", message="The embedded browser process stopped unexpectedly.")
 
     def _policy(self, view, decision, kind, page):
+        if not self._active_page(page):
+            decision.ignore()
+            return True
         WebKit = self.WebKit
         if kind == WebKit.PolicyDecisionType.RESPONSE:
             return False
@@ -365,26 +538,39 @@ class WebBridge:
             return True
         if not page.delegate:
             return False
+        if len(self.decisions) >= MAX_PENDING:
+            decision.ignore()
+            self._event(page, "error", message="Too many pending page navigations.")
+            return True
         self.decision_id += 1
         number = self.decision_id
-        self.decisions[number] = decision
-        GLib.timeout_add_seconds(15, self._expire_decision, number)
+        source = GLib.timeout_add_seconds(15, self._expire_decision, number)
+        self.decisions[number] = (decision, page, source)
         self._event(page, "navigation", decision=number, url=url, type=int(action.get_navigation_type()))
         return True
 
     def _expire_decision(self, number):
-        decision = self.decisions.pop(number, None)
-        if decision:
-            decision.ignore()
+        entry = self.decisions.pop(number, None)
+        if entry:
+            entry[0].ignore()
         return False
 
+    def _resolve_decision(self, number, allow):
+        entry = self.decisions.pop(number, None)
+        if entry:
+            decision, page, source = entry
+            GLib.source_remove(source)
+            decision.use() if allow and self._active_page(page) else decision.ignore()
+
     def _message(self, _manager, value, page, name):
+        if not self._active_page(page):
+            return
         text = value.to_json(0)
         body = None
         if text:
             try:
                 body = json.loads(text)
-            except ValueError:
+            except (ValueError, RecursionError):
                 body = None
         self._event(page, "message", name=name, body=body)
 
@@ -398,22 +584,17 @@ class WebBridge:
         if op == "attach":
             return  # the game's window: the browser stays a window of its own
         if op == "policy":
-            decision = self.decisions.pop(message.get("decision"), None)
-            if decision:
-                decision.use() if message.get("allow") else decision.ignore()
-            return
-        if op == "close":
-            if self.current and self.current.id == page_id:
-                self.current = None
-                self._return_to_game()
-            page = self.pages.pop(page_id, None)
-            if page and page.view:
-                page.view.stop_loading()
-                self.stack.remove(page.view)
-                page.view = None
+            number = message.get("decision")
+            if isinstance(number, int) and not isinstance(number, bool):
+                self._resolve_decision(number, bool(message.get("allow")))
             return
         if not isinstance(page_id, int) or isinstance(page_id, bool) or page_id < 0 or page_id > 1000000:
             self._reply_error(message.get("request"), "Invalid embedded page")
+            return
+        if op == "close":
+            page = self.pages.get(page_id)
+            if page:
+                self._close_page(page)
             return
         if op == "cookies-get":
             if not self.session:
@@ -430,8 +611,14 @@ class WebBridge:
             return
         if op in ("eval", "back", "forward", "reload", "stop") and page_id not in self.pages:
             self._reply_error(message.get("request"), "The embedded page was closed", page_id)
+            if message.get("request") is None:
+                self.send({"view": page_id, "event": "error", "message": "The embedded page was closed."})
             return
         page = self._page(page_id)
+        if not page:
+            self._reply_error(message.get("request"), "Too many embedded pages", page_id)
+            self.send({"view": page_id, "event": "error", "message": "Too many embedded pages."})
+            return
         if op == "load":
             self._load(page, message)
         elif op == "user-agent":
@@ -474,13 +661,18 @@ class WebBridge:
                 if isinstance(name, str) and isinstance(value, str) and _header_ok(name, value):
                     fields.replace(name, value)
         page.view.load_request(request)
-        self.window.present()
-        page.view.grab_focus()
+        if self._active_page(page):
+            self.window.present()
+            page.view.grab_focus()
 
     def _eval(self, page, number, script):
         if not isinstance(script, str):
             self._reply_error(number, "Invalid JavaScript request", page.id)
             return
+        job = self._begin_async(number, page)
+        if not job:
+            return
+        token, cancellable = job
 
         def done(view, result):
             reply = {"view": page.id, "event": "reply", "request": number}
@@ -489,23 +681,44 @@ class WebBridge:
                 text = value.to_json(0) if value else None
                 if text:
                     reply["value"] = json.loads(text)
-            except (GLib.Error, ValueError):
+            except (GLib.Error, ValueError, RecursionError):
                 reply["error"] = "JavaScript evaluation failed"
-            self.send(reply)
+            self._finish_async(token, reply)
 
-        page.view.evaluate_javascript(script, -1, None, None, None, done)
+        try:
+            page.view.evaluate_javascript(script, -1, None, None, cancellable, done)
+        except Exception:
+            self._abort_async(token)
+            raise
 
     def _handler(self, page, name):
         if not isinstance(name, str) or not name or len(name) > 128:
             return
         manager = page.view.get_user_content_manager()
+        if name in page.handlers:
+            return
+        if len(page.handlers) >= MAX_PENDING:
+            self._event(page, "error", message="Too many page message handlers.")
+            return
         if manager.register_script_message_handler(name, None):
-            manager.connect(f"script-message-received::{name}", self._message, page, name)
+            page.handlers.add(name)
+            page.signals.append((manager, manager.connect(f"script-message-received::{name}",
+                                                        self._message, page, name)))
 
     def _script(self, page, message):
         WebKit = self.WebKit
         source = message.get("script")
         if not isinstance(source, str):
+            return
+        script_id = message.get("scriptId")
+        if not isinstance(script_id, int) or isinstance(script_id, bool):
+            script_id = None
+        key = (script_id, source, bool(message.get("mainOnly")), bool(message.get("atEnd")))
+        if key in page.scripts:
+            return  # loadRequest replays the same configuration on each load
+        size = len(source.encode("utf-8"))
+        if len(page.scripts) >= MAX_PENDING or page.script_bytes + size > MAX_QUEUE_BYTES:
+            self._event(page, "error", message="Too many injected page scripts.")
             return
         script = WebKit.UserScript.new(
             source,
@@ -513,9 +726,15 @@ class WebBridge:
             WebKit.UserScriptInjectionTime.END if message.get("atEnd") else WebKit.UserScriptInjectionTime.START,
             None, None)
         page.view.get_user_content_manager().add_script(script)
+        page.scripts.add(key)
+        page.script_bytes += size
 
     def _cookies_get(self, number):
         manager = self.session.get_cookie_manager()
+        job = self._begin_async(number)
+        if not job:
+            return
+        token, cancellable = job
 
         def done(manager, result):
             reply = {"view": 0, "event": "reply", "request": number}
@@ -532,9 +751,13 @@ class WebBridge:
                 reply["value"] = values
             except GLib.Error:
                 reply["error"] = "Could not read browser cookies"
-            self.send(reply)
+            self._finish_async(token, reply)
 
-        manager.get_all_cookies(None, done)
+        try:
+            manager.get_all_cookies(cancellable, done)
+        except Exception:
+            self._abort_async(token)
+            raise
 
     def _cookie_set(self, number, cookie):
         if not isinstance(cookie, dict):
@@ -553,6 +776,10 @@ class WebBridge:
             date = GLib.DateTime.new_from_unix_utc(int(expires))
             if date:
                 soup_cookie.set_expires(date)
+        job = self._begin_async(number)
+        if not job:
+            return
+        token, cancellable = job
 
         def done(manager, result):
             reply = {"view": 0, "event": "reply", "request": number}
@@ -560,6 +787,10 @@ class WebBridge:
                 manager.add_cookie_finish(result)
             except GLib.Error:
                 reply["error"] = "Could not write browser cookie"
-            self.send(reply)
+            self._finish_async(token, reply)
 
-        self.session.get_cookie_manager().add_cookie(soup_cookie, None, done)
+        try:
+            self.session.get_cookie_manager().add_cookie(soup_cookie, cancellable, done)
+        except Exception:
+            self._abort_async(token)
+            raise

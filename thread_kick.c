@@ -20,9 +20,9 @@
  * tgkill, as exit_compat.c calls exit_group: pthread_kill with the pthread_t
  * of a thread that has exited reads freed memory, a stale id only gives ESRCH.
  *
- * When the watchdog asks, the handler also records where the thread was (RIP
- * and the frame-pointer chain within its stack); the watchdog thread names the
- * addresses with dladdr, which is not safe inside a signal handler.
+ * When asked, the handler records only the interrupted RIP. It neither
+ * dereferences application stack pointers nor enters pthread/loader APIs.
+ * The watchdog prints the raw address without taking the dynamic loader lock.
  * MACOBLOX_NO_KICK=1 turns the kicks off (stalls and long mutex waits are
  * still logged, without the location).
  *
@@ -31,7 +31,6 @@
  * and some of Roblox's callers do not cope with that (see the untimed waits
  * in darling_fixes.c). The watchdog checks again right before each kick. */
 typedef unsigned long size_t;
-typedef struct { const char *fname; void *fbase; const char *sname; void *saddr; } dl_info_t;
 struct darwin_sigaction_t { void (*handler)(int, void *, void *); unsigned int mask; int flags; };
 
 extern char *getenv(const char *);
@@ -39,11 +38,7 @@ extern int sigaction(int, const struct darwin_sigaction_t *, struct darwin_sigac
 extern int pthread_key_create(unsigned long *, void (*)(void *));
 extern void *pthread_getspecific(unsigned long);
 extern int pthread_setspecific(unsigned long, const void *);
-extern void *pthread_self(void);
-extern void *pthread_get_stackaddr_np(void *);
-extern size_t pthread_get_stacksize_np(void *);
 extern unsigned long long mach_absolute_time(void);
-extern int dladdr(const void *, dl_info_t *);
 extern int snprintf(char *, size_t, const char *, ...);
 extern long write(int, const void *, size_t);
 
@@ -80,81 +75,83 @@ long macoblox_thread_id(void) {
 
 /* Location requests, one per thread asked. Only the watchdog thread asks and
  * reads; the kicked thread's handler fills its slot in. */
-#define LOCATION_FRAMES 12
 #define LOCATION_SLOTS 4
 #define LOCATION_EXPIRES_NS 1000000000ULL
+enum { LOCATION_FREE, LOCATION_PENDING, LOCATION_WRITING, LOCATION_READY, LOCATION_RESERVED };
 static struct {
-    volatile long tid; /* 0 = free */
-    volatile unsigned long long asked;
-    void *volatile frames[LOCATION_FRAMES];
-    volatile int count, ready;
+    volatile unsigned int state;
+    volatile long tid;
+    unsigned long long asked;
+    unsigned long long instruction;
 } locations[LOCATION_SLOTS];
 
 static void kick_handler(int signal, void *info, void *context) {
     (void)signal;
     (void)info;
-    if (!context)
-        return;
-    long self = 0;
+    long self = linux_syscall3(LINUX_GETTID, 0, 0, 0);
     for (int slot = 0; slot < LOCATION_SLOTS; slot++) {
-        if (!locations[slot].tid || locations[slot].ready)
+        if (__atomic_load_n(&locations[slot].state, __ATOMIC_ACQUIRE) != LOCATION_PENDING ||
+            __atomic_load_n(&locations[slot].tid, __ATOMIC_RELAXED) != self)
             continue;
-        if (!self)
-            self = linux_syscall3(LINUX_GETTID, 0, 0, 0);
-        if (locations[slot].tid != self)
+        unsigned int expected = LOCATION_PENDING;
+        if (!__atomic_compare_exchange_n(&locations[slot].state, &expected, LOCATION_WRITING,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
             continue;
-        /* ucontext_t: uc_mcontext at word 6; mcontext: RBP word 8, RSP 9, RIP 18. */
-        unsigned long long *mc = (unsigned long long *)((unsigned long long *)context)[6];
-        if (!mc)
-            return;
-        int count = 0;
-        locations[slot].frames[count++] = (void *)mc[18];
-        void *thread = pthread_self();
-        unsigned long top = (unsigned long)pthread_get_stackaddr_np(thread);
-        unsigned long bottom = top - pthread_get_stacksize_np(thread);
-        unsigned long frame = mc[8];
-        if (frame < mc[9] || frame < bottom)
-            frame = 0;
-        /* Only frames within the used part of the stack: always mapped, so a
-         * register that is not a frame pointer gives junk addresses, not a crash. */
-        while (count < LOCATION_FRAMES && frame && frame + 16 <= top && !(frame & 7)) {
-            void *const *pair = (void *const *)frame;
-            if (!pair[1])
-                break;
-            locations[slot].frames[count++] = pair[1];
-            unsigned long next = (unsigned long)pair[0];
-            if (next <= frame)
-                break;
-            frame = next;
+        // The watchdog may have reassigned an expired pending slot just before
+        // this CAS. Verify its new owner while the slot is exclusively ours.
+        if (__atomic_load_n(&locations[slot].tid, __ATOMIC_RELAXED) != self) {
+            __atomic_store_n(&locations[slot].state, LOCATION_PENDING, __ATOMIC_RELEASE);
+            continue;
         }
-        locations[slot].count = count;
-        __sync_synchronize();
-        locations[slot].ready = 1;
+        unsigned long long instruction = 0;
+        if (context) {
+            const unsigned long long* uc = context;
+            const unsigned long long* mc = (const unsigned long long*)uc[6];
+            if (mc && uc[5] >= 19 * sizeof(*mc))
+                instruction = mc[18];
+        }
+        locations[slot].instruction = instruction;
+        __atomic_store_n(&locations[slot].state, LOCATION_READY, __ATOMIC_RELEASE);
         return;
     }
 }
 
-/* Ask `tid` to record where it is at the next kick, unless it was asked
- * already. False when all slots are taken by requests under a second old. */
+/* Only the watchdog reserves/expires slots. A signal writer owns its slot
+ * until publication, so expiration can never overwrite an in-flight result. */
 static int ask_location(long tid, unsigned long long now) {
-    int free_slot = -1;
     for (int slot = 0; slot < LOCATION_SLOTS; slot++) {
-        long owner = locations[slot].tid;
-        if (owner == tid)
+        unsigned int state = __atomic_load_n(&locations[slot].state, __ATOMIC_ACQUIRE);
+        if (state == LOCATION_FREE || __atomic_load_n(&locations[slot].tid, __ATOMIC_RELAXED) != tid)
+            continue;
+        if (state == LOCATION_WRITING || state == LOCATION_RESERVED)
             return 1;
-        if (free_slot < 0 && (!owner || now - locations[slot].asked > LOCATION_EXPIRES_NS))
-            free_slot = slot;
+        unsigned int expected = state;
+        if (!__atomic_compare_exchange_n(&locations[slot].state, &expected, LOCATION_RESERVED,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return 1;
+        // A new locating kick must not consume a ready result from an earlier
+        // wait by the same thread, even if that result has not expired yet.
+        locations[slot].asked = now;
+        locations[slot].instruction = 0;
+        __atomic_store_n(&locations[slot].state, LOCATION_PENDING, __ATOMIC_RELEASE);
+        return 1;
     }
-    if (free_slot < 0)
-        return 0;
-    locations[free_slot].tid = 0;
-    __sync_synchronize();
-    locations[free_slot].ready = 0;
-    locations[free_slot].count = 0;
-    locations[free_slot].asked = now;
-    __sync_synchronize();
-    locations[free_slot].tid = tid;
-    return 1;
+    for (int slot = 0; slot < LOCATION_SLOTS; slot++) {
+        unsigned int state = __atomic_load_n(&locations[slot].state, __ATOMIC_ACQUIRE);
+        if (state == LOCATION_WRITING || state == LOCATION_RESERVED ||
+            (state != LOCATION_FREE && now - locations[slot].asked <= LOCATION_EXPIRES_NS))
+            continue;
+        unsigned int expected = state;
+        if (!__atomic_compare_exchange_n(&locations[slot].state, &expected, LOCATION_RESERVED,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            continue;
+        locations[slot].asked = now;
+        locations[slot].instruction = 0;
+        __atomic_store_n(&locations[slot].tid, tid, __ATOMIC_RELAXED);
+        __atomic_store_n(&locations[slot].state, LOCATION_PENDING, __ATOMIC_RELEASE);
+        return 1;
+    }
+    return 0;
 }
 
 __attribute__((constructor)) static void install_kick_handler(void) {
@@ -181,46 +178,29 @@ int macoblox_kick(long tid, int locate) {
 
 int macoblox_kicks_enabled(void) { return kicks_enabled; }
 
-static void append(char *out, size_t size, size_t *used, const char *text) {
-    while (*text && *used + 1 < size)
-        out[(*used)++] = *text++;
-    out[*used] = 0;
-}
-
-/* If `tid` has recorded its location, write it as "lib (symbol+offset) <
- * caller < ..." to `out`, free the request and return 1. */
+/* Consume a published location without loader locks or arbitrary stack
+ * reads. A raw RIP remains useful with the launch log's executable slide. */
 int macoblox_located(long tid, char *out, size_t size) {
-    int slot = 0;
-    while (slot < LOCATION_SLOTS && !(locations[slot].tid == tid && locations[slot].ready))
-        slot++;
-    if (!size || slot == LOCATION_SLOTS)
+    if (!size)
         return 0;
-    __sync_synchronize();
-    size_t used = 0;
-    out[0] = 0;
-    for (int i = 0; i < locations[slot].count; i++) {
-        char part[160];
-        dl_info_t info = {0, 0, 0, 0};
-        void *address = locations[slot].frames[i];
-        if (dladdr(address, &info) && info.fname) {
-            const char *name = info.fname;
-            for (const char *c = info.fname; *c; c++)
-                if (*c == '/') name = c + 1;
-            if (info.sname)
-                snprintf(part, sizeof part, "%s (%s+%ld)", name, info.sname,
-                         (long)((char *)address - (char *)info.saddr));
-            else
-                snprintf(part, sizeof part, "%s+0x%lx", name,
-                         (unsigned long)((char *)address - (char *)info.fbase));
-        } else {
-            snprintf(part, sizeof part, "%p", address);
-        }
-        if (i)
-            append(out, size, &used, " < ");
-        append(out, size, &used, part);
+    for (int slot = 0; slot < LOCATION_SLOTS; slot++) {
+        if (__atomic_load_n(&locations[slot].state, __ATOMIC_ACQUIRE) != LOCATION_READY ||
+            __atomic_load_n(&locations[slot].tid, __ATOMIC_RELAXED) != tid)
+            continue;
+        unsigned int expected = LOCATION_READY;
+        if (!__atomic_compare_exchange_n(&locations[slot].state, &expected, LOCATION_RESERVED,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            continue;
+        unsigned long long instruction = locations[slot].instruction;
+        if (instruction)
+            snprintf(out, size, "RIP=0x%llx", instruction);
+        else
+            snprintf(out, size, "(register context unavailable)");
+        __atomic_store_n(&locations[slot].tid, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&locations[slot].state, LOCATION_FREE, __ATOMIC_RELEASE);
+        return 1;
     }
-    locations[slot].tid = 0;
-    return 1;
+    return 0;
 }
 
 /* ------------------------------------------------------- mutex waits */

@@ -184,6 +184,48 @@ For a manual settings edit, `"dpi_scale": 2.0` in
 `~/.config/macoblox/settings.json` selects 200%. The `resolution` key is not
 supported. If you previously added `DFFlagDisableDPIScale`, remove it from your
 custom fast flags before testing scaling.
+
+Custom scaling requires a supported client input layout. If the launch log
+says **UI scale skipped**, the client keeps its original surface scale.
+</details>
+
+<details>
+<summary>Roblox closes or fails at launch</summary>
+
+Enable **Settings → Environment → Diagnostics → Crash diagnostics**, then
+restart Roblox and collect the entire new launch log. This optional mode
+records fatal signal registers and window-startup call boundaries. It replaces
+the client's fatal signal handlers for that run; turn it off after collecting
+the log. It cannot capture an external kill or every Darling server failure.
+
+For source installations, the same switch is available as:
+
+```bash
+MACOBLOX_DIAGNOSTIC_SIGNALS=1 ./launcher/macoblox-launcher
+```
+
+Source checkouts write launch logs to their `logs/` directory; read-only
+packages use `~/.local/share/macoblox/logs/` by default. For Flatpak,
+use `~/.var/app/wtf.aubree.MacOBlox/data/macoblox/logs/`. Also collect
+`private/var/log/dserver.log` inside the selected Darling prefix: normally
+`~/.darling/`, or `~/.var/app/wtf.aubree.MacOBlox/data/darling/` for Flatpak.
+
+The lifecycle record describes the observed state before cleanup. A final
+`Broken pipe` can follow cleanup and does not identify the original failure.
+</details>
+
+<details>
+<summary>Text disappears while typing</summary>
+
+For a source installation, close the launcher and start it with optional
+selection diagnostics:
+
+```bash
+MACOBLOX_TRACE_TEXT_INPUT=1 ./launcher/macoblox-launcher
+```
+
+The trace records text lengths, selection ranges and composition state in
+the launch log, without recording typed content. It is disabled by default.
 </details>
 
 <details>

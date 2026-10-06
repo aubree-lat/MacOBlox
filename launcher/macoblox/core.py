@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import __version__
 from .i18n import _
+from .rootless_scope import rootless_process_in_prefix
 
 PROJECT = Path(__file__).resolve().parents[2]
 # Everything the launcher writes: the project folder for a git checkout, the
@@ -633,12 +634,14 @@ def _process_in_prefix(pid, namespaces=()):
             return False
         namespace = _mount_namespace(pid)
         if namespace is None:
-            return False
+            return rootless_process_in_prefix(pid, DARLING_PREFIX, NOROOT_LIB)
         if namespace in namespaces:
             return True
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         argv = [argument.decode(errors="replace") for argument in argv if argument]
-        return _server_for_prefix(pid, argv) or _process_prefix(pid) == DARLING_PREFIX.resolve()
+        return (_server_for_prefix(pid, argv)
+                or rootless_process_in_prefix(pid, DARLING_PREFIX, NOROOT_LIB)
+                or _process_prefix(pid) == DARLING_PREFIX.resolve())
     except (OSError, RuntimeError):
         return False
 
@@ -697,22 +700,40 @@ def _darling_processes():
 
 def _container_processes(servers):
     """Darling processes in the containers of the darlingservers `servers`
-    (a container is a mount namespace; launchd and the daemons are not
-    darlingserver's children)."""
+    (private mount namespaces, or proven prefix runtime mappings for rootless
+    guests). launchd and the daemons may not be server children."""
     namespaces = _prefix_namespaces(servers)
-    return [pid for pid, namespace in _darling_processes() if namespace in namespaces]
+    server_ids = set(servers)
+    rootless_selected = bool(NOROOT_LIB) and any(
+        pid in server_ids and _server_for_prefix(pid, argv) for pid, argv in _user_commands())
+    return [pid for pid, namespace in _darling_processes()
+            if namespace in namespaces or (rootless_selected and
+                rootless_process_in_prefix(pid, DARLING_PREFIX, NOROOT_LIB))]
 
 
 def _orphaned_darling_processes():
     """Orphaned Darling processes proven to belong to the selected prefix."""
-    servers = [pid for pid, argv in _user_commands() if argv and Path(argv[0]).name == "darlingserver"]
+    server_commands = [(pid, argv) for pid, argv in _user_commands()
+                       if argv and Path(argv[0]).name == "darlingserver"]
+    servers = [pid for pid, _argv in server_commands]
     alive = {_mount_namespace(pid) for pid in servers} - {None}
+    selected_server_alive = any(_server_for_prefix(pid, argv) for pid, argv in server_commands)
     try:
         selected = DARLING_PREFIX.resolve()
     except (OSError, RuntimeError):
         return []
-    return [pid for pid, namespace in _darling_processes()
-            if namespace is not None and namespace not in alive and _process_prefix(pid) == selected]
+    overlay_orphans, rootless_orphans = [], []
+    for pid, namespace in _darling_processes():
+        if namespace is not None and namespace not in alive and _process_prefix(pid) == selected:
+            overlay_orphans.append(pid)
+        elif (NOROOT_LIB and not selected_server_alive and
+              rootless_process_in_prefix(pid, selected, NOROOT_LIB)):
+            rootless_orphans.append(pid)
+    # A server may have started while the guest mappings were being scanned.
+    # A shared namespace cannot distinguish its current guests from orphans.
+    if rootless_orphans and darlingserver_running():
+        rootless_orphans = []
+    return overlay_orphans + rootless_orphans
 
 
 def _terminate(pids, wait=5.0, *, scope=None):
@@ -809,7 +830,28 @@ def clear_orphaned_darling():
     """End proven selected-prefix leftovers; preserve other/unknown scopes."""
     orphans = _orphaned_darling_processes()
     if orphans:
-        _terminate(orphans, scope=_process_in_prefix)
+        def still_orphaned(pid):
+            if NOROOT_LIB:
+                # Never fall through to broad server/prefix membership if the
+                # collected guest has vanished or its PID has been reused.
+                return (rootless_process_in_prefix(pid, DARLING_PREFIX, NOROOT_LIB)
+                        and not darlingserver_running())
+            try:
+                process = Path(f"/proc/{pid}")
+                if process.stat().st_uid != os.getuid():
+                    return False
+                if os.readlink(process / "exe").rsplit("/", 1)[-1] != "mldr":
+                    return False
+                namespace = _mount_namespace(pid)
+                live = {_mount_namespace(server) for server, argv in _user_commands()
+                        if argv and Path(argv[0]).name == "darlingserver"}
+                return (namespace is not None and namespace not in live
+                        and _process_prefix(pid) == DARLING_PREFIX.resolve())
+            except (OSError, RuntimeError):
+                return False
+        # Scope is rechecked after obtaining the stable pidfd, so a server
+        # starting after collection cannot make new rootless guests targets.
+        _terminate(orphans, scope=still_orphaned)
     return len(orphans)
 
 
@@ -1481,9 +1523,12 @@ class HostAudio:
 
     NAME = "Roblox (Mac O’ Blox)"
 
-    def __init__(self, fifo, keep, player):
+    def __init__(self, fifo, keep=None, player=None):
         self.fifo, self.keep, self.player = fifo, keep, player
         self.restarted_at = 0.0
+        self._state_lock = threading.RLock()
+        self._stopped = False
+        self._owned_paths = set()
         # The microphone (voice chat): the shim reads raw float32 audio from a
         # second FIFO. A recorder runs only while the game asks for it, with
         # a request file next to the FIFO naming the rate and channel count.
@@ -1491,12 +1536,6 @@ class HostAudio:
         self.request = Path(str(self.input_fifo) + ".request")
         self.recorder = None
         self.recording = None
-        for path in (self.input_fifo, self.request):
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        os.mkfifo(self.input_fifo, 0o600)
 
     def _keep_recording(self):
         wanted = None
@@ -1519,15 +1558,33 @@ class HostAudio:
                     pass
 
     def _stop_recorder(self):
-        if not self.recorder:
+        with self._state_lock:
+            recorder, self.recorder = self.recorder, None
+            self.recording = None
+            self._stop_process(recorder)
+
+    @staticmethod
+    def _stop_process(process):
+        """Stop and reap an owned audio subprocess without skipping cleanup."""
+        if process is None:
             return
-        self.recorder.terminate()
         try:
-            self.recorder.wait(timeout=2)
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            self.recorder.kill()
-        self.recorder = None
-        self.recording = None
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
+            pass
 
     @classmethod
     def _recorder_command(cls, fifo, rate, channels):
@@ -1558,15 +1615,18 @@ class HostAudio:
     def keep_playing(self):
         """Restart the player if it has exited (PipeWire restarted, say):
         the game keeps writing into the FIFO and would stay silent."""
-        self._keep_recording()
-        if self.player.poll() is None or time.time() - self.restarted_at < 5:
-            return
-        self.restarted_at = time.time()
-        if self._player_command(self.fifo):
-            try:
-                self.player = self._spawn(self.fifo)
-            except OSError:
-                pass
+        with self._state_lock:
+            if self._stopped:
+                return
+            self._keep_recording()
+            if self.player.poll() is None or time.monotonic() - self.restarted_at < 5:
+                return
+            self.restarted_at = time.monotonic()
+            if self._player_command(self.fifo):
+                try:
+                    self.player = self._spawn(self.fifo)
+                except OSError:
+                    pass
 
     @classmethod
     def _player_command(cls, fifo):
@@ -1590,36 +1650,54 @@ class HostAudio:
             return None
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         fifo = CACHE_DIR / f"audio-{os.getpid()}.fifo"
-        if fifo.exists():
-            fifo.unlink()
-        os.mkfifo(fifo, 0o600)
-        keep = os.open(fifo, os.O_RDWR)
-        return cls(fifo, keep, cls._spawn(fifo))
+        audio = cls(fifo)
+        try:
+            fifo.unlink(missing_ok=True)
+            os.mkfifo(fifo, 0o600)
+            audio._owned_paths.add(fifo)
+            audio.keep = os.open(fifo, os.O_RDWR)
+            for path in (audio.input_fifo, audio.request):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            os.mkfifo(audio.input_fifo, 0o600)
+            audio._owned_paths.add(audio.input_fifo)
+            audio.player = cls._spawn(fifo)
+            return audio
+        except BaseException:
+            audio.stop()
+            raise
 
     def stop(self):
         # pw-cat sits in a blocking read on the FIFO and only sees SIGTERM
         # once that returns: closing the last writer ends the read (end of
         # file). A player that still hangs is killed and reaped.
-        self._stop_recorder()
-        for path in (self.input_fifo, self.request):
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        os.close(self.keep)
-        self.player.terminate()
-        try:
-            self.player.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.player.kill()
-            try:
-                self.player.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-        try:
-            self.fifo.unlink()
-        except OSError:
-            pass
+        with self._state_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._stop_recorder()
+            if self.input_fifo in self._owned_paths:
+                for path in (self.input_fifo, self.request):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+            keep, self.keep = self.keep, None
+            if keep is not None:
+                try:
+                    os.close(keep)
+                except OSError:
+                    pass
+            player, self.player = self.player, None
+            self._stop_process(player)
+            if self.fifo in self._owned_paths:
+                try:
+                    self.fifo.unlink()
+                except OSError:
+                    pass
+            self._owned_paths.clear()
 
 
 class RobloxSession:
@@ -1632,6 +1710,8 @@ class RobloxSession:
         self.launch_uri = launch_uri
         self.log_path = None
         self.process = None
+        self._lifecycle_logged = False
+        self._lifecycle_lock = threading.Lock()
         self.seen_roblox = False
         self.gone_since = None
         self.game_pids = []
@@ -1711,8 +1791,13 @@ class RobloxSession:
             # Darling's own audio path crashes the game (see HostAudio).
             variables.append("MACOBLOX_AUDIO=0")
         for key, name in TRACE_ENV.items():
-            if self.settings.get(key):
+            if self.settings.get(key) or (key == "diagnostic_signals" and
+                                         os.environ.get(name) == "1"):
                 variables.append(f"{name}=1")
+        # Selection diagnostics record lengths/ranges only and are enabled
+        # explicitly for a reported typing issue, without changing settings.
+        if os.environ.get("MACOBLOX_TRACE_TEXT_INPUT") == "1":
+            variables.append("MACOBLOX_TRACE_TEXT_INPUT=1")
         # Cocoa URL delivery diagnostics are opt-in and stay outside URI
         # handling. They are copied verbatim into the Darling process so a
         # live run can compare selector order and launch timing.
@@ -1737,7 +1822,7 @@ class RobloxSession:
         try:
             self._start()
         except BaseException:
-            self.finish()
+            self.finish("startup_failure")
             raise
 
     def _start(self):
@@ -1784,11 +1869,6 @@ class RobloxSession:
             self.dns = DnsForwarder(provider, self.settings.get("dns_custom", ""))
         self.audio = HostAudio.start()
         clear_stale_darling()
-        if not darlingserver_running():
-            # The first process after darlingserver starts sometimes fails to
-            # check in; warm the server up with a trivial command first.
-            subprocess.run(["darling", "shell", "true"], env=env, stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         LOGS.mkdir(parents=True, exist_ok=True)
         # The Mesa shader cache dir must exist before the game opens it.
         (CACHE_DIR / "mesa-shader-cache").mkdir(parents=True, exist_ok=True)
@@ -1797,14 +1877,31 @@ class RobloxSession:
         (CACHE_DIR / "roblox-tmp").mkdir(parents=True, exist_ok=True)
         cleanup_logs(int(self.settings.get("keep_logs", 30)) - 1)
         self.log_path = LOGS / time.strftime("launch-%Y%m%d-%H%M%S.log")
-        with open(self.log_path, "wb") as log:
+        # Truncate for this launch, but keep O_APPEND on the inherited file
+        # description: guest output must not overwrite a host lifecycle record.
+        with open(self.log_path, "wb", opener=lambda path, flags:
+                  os.open(path, flags | os.O_APPEND)) as log:
             log.write(f"Mac O’ Blox {__version__}\n".encode())
             log.write(f"Darling: {darling_version(env)}\n".encode())
             log.write(f"Renderer requested: {renderer_name}\n".encode())
+            packaging = "Flatpak" if os.environ.get("FLATPAK_ID") else (
+                "prebuilt" if PREBUILT_SHIM else "source")
+            version = re.sub(r"[^A-Za-z0-9._+-]", "?", (installed_version() or "unknown")[:80])
+            log.write(f"Packaging: {packaging}; Roblox version: {version}\n".encode())
             if leftover:
                 log.write(f"Requested cleanup of {len(leftover)} selected-prefix Roblox process(es) of an earlier game\n".encode())
             if orphans:
                 log.write(f"Requested cleanup of {orphans} selected-prefix Darling process(es) left without their darlingserver\n".encode())
+            if not darlingserver_running():
+                # The first process can fail to check in while the server
+                # starts. Keep this warmup's output: a server failure must not
+                # vanish before the client log begins.
+                log.write(b"[MacOBlox Startup] Darling warmup starting\n")
+                log.flush()
+                warmup = subprocess.run(["darling", "shell", "true"], env=env,
+                                        stdin=subprocess.DEVNULL, stdout=log,
+                                        stderr=subprocess.STDOUT, timeout=120)
+                log.write(f"[MacOBlox Startup] Darling warmup status={warmup.returncode}\n".encode())
             changed = raise_darling_priority()
             if changed:
                 log.write(f"Priority: {changed} Darling processes raised to nice {_nice_target(SERVER_NICE)}\n".encode())
@@ -1816,7 +1913,7 @@ class RobloxSession:
             self.process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                             stdout=log, stderr=subprocess.STDOUT,
                                             start_new_session=True)
-        self.started_at = time.time()
+        self.started_at = time.monotonic()
         threading.Thread(target=self._suppress_crash_handler, daemon=True).start()
 
     def _suppress_crash_handler(self):
@@ -1835,7 +1932,7 @@ class RobloxSession:
         """None while running, otherwise the exit status (or -1 if unknown)."""
         status = self.process.poll() if self.process else -1
         if status is not None:
-            self.finish()
+            self.finish("frontend_exit", frontend_status=status)
             return status
         if self.audio:
             self.audio.keep_playing()
@@ -1844,16 +1941,16 @@ class RobloxSession:
         # the session can end for the user as soon as quitting began.
         # seen_roblox keeps a sentinel left from a dead session irrelevant.
         if self.seen_roblox and QUIT_SENTINEL.exists():
-            self.finish()
+            self.finish("quit_sentinel")
             return -1
         # Suppress any crash handler to prevent slow dumps and exit blockage
-        if self.seen_roblox and time.time() - self.started_at > 3:
+        if self.seen_roblox and time.monotonic() - self.started_at > 3:
             _kill_crash_handlers()
 
         # darling shell can outlive a Roblox that was killed; watch the game
         # processes themselves as well. Known ones are checked each second,
         # the whole of /proc only when they are gone or every few seconds.
-        now = time.time()
+        now = time.monotonic()
         namespaces = _prefix_namespaces()
         self.game_pids = [pid for pid in self.game_pids if _process_state(pid) not in (None, "Z")
                           and _roblox_process_in_prefix(pid, namespaces, ("RobloxPlayer",))]
@@ -1864,14 +1961,45 @@ class RobloxSession:
             self.seen_roblox = True
             self.gone_since = None
         elif self.seen_roblox:
-            self.gone_since = self.gone_since or time.time()
-            if time.time() - self.gone_since > 0.5:
-                self.finish()
+            self.gone_since = self.gone_since or time.monotonic()
+            if time.monotonic() - self.gone_since > 0.5:
+                self.finish("roblox_disappeared")
                 return -1
         return None
 
-    def finish(self):
+    def _record_lifecycle(self, reason, frontend_status=None):
+        """Record the observed state once, before cleanup can alter it."""
+        with self._lifecycle_lock:
+            if self._lifecycle_logged or not self.log_path:
+                return
+            self._lifecycle_logged = True
+            try:
+                frontend = "not_started"
+                if self.process:
+                    status = frontend_status if frontend_status is not None else self.process.poll()
+                    frontend = "running" if status is None else str(status)
+                try:
+                    game_count = str(len(roblox_pids(("RobloxPlayer",))))
+                except Exception:
+                    game_count = "unknown"
+                # Reasons and field values are local observations only; no
+                # command line, URI, typed text or authenticated session data.
+                if reason not in ("frontend_exit", "roblox_disappeared", "quit_sentinel",
+                                  "startup_failure", "explicit_cleanup"):
+                    reason = "explicit_cleanup"
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                record = (f"\n[MacOBlox Lifecycle] time={stamp} reason={reason} "
+                          f"frontend_status={frontend} selected_prefix_games={game_count} "
+                          "guest_exit=unknown before_cleanup=1\n")
+                with open(self.log_path, "ab", buffering=0) as log:
+                    log.write(record.encode())
+            except Exception:
+                # Failure to collect or append diagnostics cannot stop cleanup.
+                pass
+
+    def finish(self, reason="explicit_cleanup", frontend_status=None):
         leftover = roblox_pids()
+        self._record_lifecycle(reason, frontend_status)
         if leftover:
             _terminate_roblox(leftover, wait=1)
         if self.process and self.process.poll() is None:

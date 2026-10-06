@@ -10,6 +10,8 @@ static MacOBloxSurfaceSettings (*macoblox_original_surface_settings)(id, SEL);
 static double macoblox_requested_surface_scale;
 static int macoblox_surface_scale_install_state; /* 0 retry, 1 installing, 2 done */
 static int macoblox_surface_scale_invalid_warned;
+static int macoblox_surface_scale_applied_logged;
+static int macoblox_surface_scale_override_warned;
 
 static MacOBloxSurfaceSettings macoblox_scaled_surface_settings(id self, SEL cmd) {
     MacOBloxSurfaceSettings (*original)(id, SEL) = __atomic_load_n(
@@ -17,9 +19,23 @@ static MacOBloxSurfaceSettings macoblox_scaled_surface_settings(id self, SEL cmd
     /* The original IMP is published before the replacement can be called.
      * Original exceptions propagate normally; this hook adds no catch. */
     MacOBloxSurfaceSettings settings = original(self, cmd);
-    if (macoblox_surface_settings_scale(&settings, macoblox_requested_surface_scale) < 0 &&
-        !__atomic_exchange_n(&macoblox_surface_scale_invalid_warned, 1, __ATOMIC_RELAXED))
-        write_str("[MacOBlox] UI scale: invalid original surface scale preserved\n");
+    float before = settings.scale;
+    int allowed = macoblox_input_scale_allowed();
+    int changed = settings.surface && settings.enabled && allowed
+        ? macoblox_surface_settings_scale(&settings, macoblox_requested_surface_scale) : 0;
+    /* Publish the factor actually returned, including float rounding. Until
+     * a valid surface is transformed, installed input adapters remain 1x. */
+    macoblox_input_scale_set(changed > 0 ? (double)settings.scale / before : 1.0);
+    if (!allowed) {
+        if (!__atomic_exchange_n(&macoblox_surface_scale_override_warned, 1, __ATOMIC_RELAXED))
+            write_str("[MacOBlox] UI scale skipped: client DebugOverrideDPIScale is enabled\n");
+    } else if (changed < 0) {
+        if (!__atomic_exchange_n(&macoblox_surface_scale_invalid_warned, 1, __ATOMIC_RELAXED))
+            write_str("[MacOBlox] UI scale: invalid original surface scale preserved\n");
+    } else if (changed > 0 &&
+               !__atomic_exchange_n(&macoblox_surface_scale_applied_logged, 1, __ATOMIC_RELAXED)) {
+        write_str("[MacOBlox] Roblox UI scale and mouse position compensation applied\n");
+    }
     return settings;
 }
 
@@ -59,11 +75,21 @@ static void macoblox_install_surface_scale_hook(void) {
         __atomic_store_n(&macoblox_surface_scale_install_state, 2, __ATOMIC_RELEASE);
         return;
     }
+    int input_hooks = macoblox_install_input_scale_hooks();
+    if (input_hooks <= 0) {
+        if (input_hooks < 0)
+            write_str(input_hooks == -2
+                ? "[MacOBlox] UI scale skipped: client mouse text protection unavailable\n"
+                : "[MacOBlox] UI scale skipped: unsupported client mouse input ABI\n");
+        __atomic_store_n(&macoblox_surface_scale_install_state,
+                         input_hooks == 0 ? 0 : 2, __ATOMIC_RELEASE);
+        return;
+    }
     macoblox_requested_surface_scale = requested;
     __atomic_store_n(&macoblox_original_surface_settings,
                      (MacOBloxSurfaceSettings (*)(id, SEL))original, __ATOMIC_RELEASE);
     method_setImplementation(method, (IMP)macoblox_scaled_surface_settings);
     __atomic_store_n(&macoblox_surface_scale_install_state, 2, __ATOMIC_RELEASE);
-    write_str("[MacOBlox] Roblox UI scale applied to client surface settings\n");
+    write_str("[MacOBlox] UI scale: guarded client mouse adapters installed\n");
 }
 #endif

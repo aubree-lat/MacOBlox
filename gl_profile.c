@@ -314,16 +314,36 @@ static void *macoblox_eglCreateWindowSurface(void *display, void *config, unsign
         return 0;
     }
     unsigned int root_visual = 0, window_visual = 0;
-    macoblox_raw_x_visuals((unsigned int)window, &root_visual, &window_visual);
+    int attributes_available = macoblox_raw_x_visuals((unsigned int)window, &root_visual, &window_visual);
     void *matching = window_visual ? config_for_visual(display, window_visual) : 0;
-    if (matching && matching != config)
+    const char *retry_status;
+    int retry_error = 0;
+    if (matching && matching != config) {
         surface = eglCreateWindowSurface(display, matching, window, attributes);
-    char line[200];
-    snprintf(line, sizeof line,
-             "[MacOBlox GL] eglCreateWindowSurface failed (EGL error 0x%x): window visual 0x%x, "
-             "config visual 0x%x, screen visual 0x%x; retry %s\n",
-             error, window_visual, config_visual(display, config), root_visual,
-             surface ? "with the window's visual worked" : "failed");
+        retry_status = surface ? "with the window's visual succeeded" : "with the window's visual failed";
+        /* The original error remains queued by capture_egl_error(). Calls
+         * within the shim bypass its eglGetError interposition, so reading
+         * the failed retry's driver error does not replace that queued error. */
+        if (!surface)
+            retry_error = eglGetError();
+    } else if (!attributes_available || !window_visual) {
+        retry_status = "not attempted (native window attributes unavailable)";
+    } else if (!matching) {
+        retry_status = "not attempted (no EGL config for the window's visual)";
+    } else {
+        retry_status = "not attempted (the window's visual already uses this config)";
+    }
+    char line[320];
+    int length = snprintf(line, sizeof line,
+             "[MacOBlox GL] eglCreateWindowSurface failed (EGL error 0x%x): native window 0x%lx, "
+             "window visual 0x%x, config visual 0x%x, screen visual 0x%x; retry %s",
+             error, window, window_visual, config_visual(display, config), root_visual, retry_status);
+    if (length >= 0 && (unsigned int)length < sizeof line) {
+        if (retry_error)
+            snprintf(line + length, sizeof line - (unsigned int)length, " (EGL error 0x%x)\n", retry_error);
+        else
+            snprintf(line + length, sizeof line - (unsigned int)length, "\n");
+    }
     log_line(line);
     if (surface)
         forget_configured_surface(surface);

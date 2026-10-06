@@ -105,6 +105,12 @@ def _error_dialog(window, heading, details):
 class GameLogsView(Gtk.Box):
     """Live streaming log viewer for Roblox Player with syntax highlighting and search."""
 
+    READ_BYTES = 64 * 1024
+    LINES_PER_UPDATE = 200
+    LINE_BYTES = 8192
+    VIEW_CHARS = 1024 * 1024
+    SEARCH_MATCHES = 2048
+
     def __init__(self, window):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.window = window
@@ -114,6 +120,13 @@ class GameLogsView(Gtk.Box):
         self.auto_scroll = True
         self.matches = []
         self.current_match_idx = -1
+        self._pending = bytearray()
+        self._discard_line = False
+        self._log_identity = None
+        self._drain_id = 0
+        self._search_refresh_id = 0
+        self._search_limited = False
+        self._search_query = ""
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         bar.set_margin_start(16)
@@ -218,6 +231,8 @@ class GameLogsView(Gtk.Box):
         self.text_view.set_top_margin(12)
         self.text_view.set_bottom_margin(12)
         self.buffer = self.text_view.get_buffer()
+        self._end_mark = self.buffer.create_mark(None, self.buffer.get_end_iter(), False)
+        self._search_anchor = self.buffer.create_mark(None, self.buffer.get_start_iter(), True)
 
         self.tag_ln = self.buffer.create_tag("log_ln", foreground="#6e6e73")
         self.tag_time = self.buffer.create_tag("log_time", foreground="#77767b")
@@ -260,16 +275,28 @@ class GameLogsView(Gtk.Box):
             self._on_search_changed(self.search_entry)
 
     def close_search(self):
+        if self._search_refresh_id:
+            GLib.source_remove(self._search_refresh_id)
+            self._search_refresh_id = 0
         self.search_revealer.set_reveal_child(False)
         self.buffer.remove_tag(self.tag_match, self.buffer.get_start_iter(), self.buffer.get_end_iter())
         self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
         self.search_count_label.set_text("")
         self.matches = []
         self.current_match_idx = -1
+        self._search_query = ""
         self.text_view.grab_focus()
 
     def _on_search_changed(self, entry):
-        query = entry.get_text().strip()
+        if self._search_refresh_id:
+            GLib.source_remove(self._search_refresh_id)
+            self._search_refresh_id = 0
+        self._rebuild_search(entry.get_text().strip())
+
+    def _rebuild_search(self, query, preserve=False):
+        self._search_limited = False
+        anchor = self.buffer.get_iter_at_mark(self._search_anchor).get_offset()
+        self._search_query = query
         self.buffer.remove_tag(self.tag_match, self.buffer.get_start_iter(), self.buffer.get_end_iter())
         self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
         if not query:
@@ -284,6 +311,9 @@ class GameLogsView(Gtk.Box):
             res = it.forward_search(query, Gtk.TextSearchFlags.CASE_INSENSITIVE, None)
             if not res:
                 break
+            if len(matches) == self.SEARCH_MATCHES:
+                self._search_limited = True
+                break
             s, e = res
             self.buffer.apply_tag(self.tag_match, s, e)
             matches.append(s.get_offset())
@@ -291,13 +321,16 @@ class GameLogsView(Gtk.Box):
 
         self.matches = matches
         if matches:
-            self.current_match_idx = 0
-            self._highlight_current_match(query)
+            self.current_match_idx = (
+                min(range(len(matches)), key=lambda i: abs(matches[i] - anchor))
+                if preserve else 0
+            )
+            self._highlight_current_match(query, scroll=not preserve)
         else:
             self.current_match_idx = -1
             self.search_count_label.set_text(_("No matches"))
 
-    def _highlight_current_match(self, query=None):
+    def _highlight_current_match(self, query=None, scroll=True):
         if not self.matches or self.current_match_idx < 0:
             return
         if query is None:
@@ -307,8 +340,11 @@ class GameLogsView(Gtk.Box):
         s = self.buffer.get_iter_at_offset(offset)
         e = self.buffer.get_iter_at_offset(offset + len(query))
         self.buffer.apply_tag(self.tag_current, s, e)
-        self.text_view.scroll_to_iter(s, 0.2, False, 0.0, 0.5)
-        self.search_count_label.set_text(f"{self.current_match_idx + 1} / {len(self.matches)}")
+        self.buffer.move_mark(self._search_anchor, s)
+        if scroll:
+            self.text_view.scroll_to_iter(s, 0.2, False, 0.0, 0.5)
+        suffix = "+" if self._search_limited else ""
+        self.search_count_label.set_text(f"{self.current_match_idx + 1} / {len(self.matches)}{suffix}")
 
     def _find_next(self):
         if not self.matches:
@@ -323,8 +359,13 @@ class GameLogsView(Gtk.Box):
         self._highlight_current_match()
 
     def _insert_highlighted_text(self, text: str):
-        lines = text.splitlines()
+        # The reader budgets LF-delimited rows. Other Unicode/control
+        # separators must not turn one row into thousands of GTK insertions.
+        lines = text.split("\n")
+        if lines and not lines[-1]:
+            lines.pop()
         for line in lines:
+            line = line.rstrip("\r")
             self.line_count += 1
             ll = line.lower()
             if "[macoblox]" in ll:
@@ -363,6 +404,12 @@ class GameLogsView(Gtk.Box):
                     self.buffer.insert(end, line + "\n")
 
     def reset(self, log_path=None):
+        if self._drain_id:
+            GLib.source_remove(self._drain_id)
+            self._drain_id = 0
+        self._pending.clear()
+        self._discard_line = False
+        self._log_identity = None
         self.current_log_path = log_path
         self.last_pos = 0
         self.line_count = 0
@@ -388,33 +435,92 @@ class GameLogsView(Gtk.Box):
 
         try:
             with open(log_path, "rb") as f:
+                info = os.fstat(f.fileno())
+                identity = (info.st_dev, info.st_ino)
+                if ((self._log_identity is not None and self._log_identity != identity)
+                        or info.st_size < self.last_pos):
+                    self.reset(log_path)
+                self._log_identity = identity
                 f.seek(self.last_pos)
-                chunk = f.read()
-                if chunk:
-                    self.last_pos = f.tell()
-                    text = chunk.decode("utf-8", errors="replace")
-                    self._insert_highlighted_text(text)
-
-                    if self.current_log_path:
-                        self.status_label.set_text(f"{self.current_log_path.name} ({self.line_count} l.)")
-
-                    line_count = self.buffer.get_line_count()
-                    if line_count > 5000:
-                        start_iter = self.buffer.get_start_iter()
-                        trim_iter = self.buffer.get_iter_at_line(line_count - 4000)
-                        self.buffer.delete(start_iter, trim_iter)
-
-                    if self.auto_scroll:
-                        end_mark = self.buffer.create_mark("end", self.buffer.get_end_iter(), False)
-                        self.text_view.scroll_to_mark(end_mark, 0.0, False, 0.0, 1.0)
+                chunk = f.read(max(0, self.READ_BYTES - len(self._pending)))
+                self.last_pos = f.tell()
+                self._pending.extend(chunk)
+                eof = self.last_pos >= info.st_size
+            inserted = False
+            for _ in range(self.LINES_PER_UPDATE):
+                newline = self._pending.find(b"\n")
+                if self._discard_line:
+                    if newline < 0:
+                        self._pending.clear()
+                        break
+                    del self._pending[:newline + 1]
+                    self._discard_line = False
+                    continue
+                shortened = newline > self.LINE_BYTES or (newline < 0 and len(self._pending) > self.LINE_BYTES)
+                if newline >= 0:
+                    line = bytes(self._pending[:min(newline, self.LINE_BYTES)])
+                    del self._pending[:newline + 1]
+                elif shortened:
+                    line = bytes(self._pending[:self.LINE_BYTES])
+                    self._pending.clear()
+                    self._discard_line = True
+                elif eof and self.window.session is None and self._pending:
+                    line = bytes(self._pending)
+                    self._pending.clear()
+                else:
+                    break
+                text = line.decode("utf-8", errors="replace")
+                if shortened:
+                    text += " … [open the log file for the full line]"
+                # Joining line fragments before decoding preserves split UTF-8
+                # characters and avoids inventing a new line for each write.
+                self._insert_highlighted_text(text + "\n")
+                inserted = True
+            if inserted:
+                self.status_label.set_text(f"{log_path.name} ({self.line_count} l.)")
+                lines = self.buffer.get_line_count()
+                if lines > 5000:
+                    trim = self.buffer.get_start_iter()
+                    trim.forward_lines(lines - 4000)
+                    self.buffer.delete(self.buffer.get_start_iter(), trim)
+                chars = self.buffer.get_char_count()
+                if chars > self.VIEW_CHARS:
+                    trim = self.buffer.get_iter_at_offset(chars - self.VIEW_CHARS * 3 // 4)
+                    trim.forward_line()
+                    self.buffer.delete(self.buffer.get_start_iter(), trim)
+                if self.search_revealer.get_reveal_child() and self.search_entry.get_text().strip():
+                    # Offsets may have moved after trimming. Invalidate them
+                    # immediately, then refresh once per bounded UI interval.
+                    self.matches = []
+                    self.current_match_idx = -1
+                    self.buffer.remove_tag(self.tag_current, self.buffer.get_start_iter(), self.buffer.get_end_iter())
+                    if not self._search_refresh_id:
+                        self._search_refresh_id = GLib.timeout_add(100, self._refresh_search)
+                if self.auto_scroll:
+                    self.text_view.scroll_to_mark(self._end_mark, 0.0, False, 0.0, 1.0)
+            backlog = (not eof or b"\n" in self._pending or len(self._pending) > self.LINE_BYTES)
+            if backlog and not self._drain_id:
+                self._drain_id = GLib.idle_add(self._drain_log)
         except Exception:
             pass
+
+    def _drain_log(self):
+        self._drain_id = 0
+        if self.get_mapped():
+            self.update()
+        return False
+
+    def _refresh_search(self):
+        self._search_refresh_id = 0
+        if self.search_revealer.get_reveal_child():
+            query = self.search_entry.get_text().strip()
+            self._rebuild_search(query, preserve=query == self._search_query)
+        return False
 
     def _on_scroll_toggled(self, btn):
         self.auto_scroll = btn.get_active()
         if self.auto_scroll:
-            end_mark = self.buffer.create_mark("end", self.buffer.get_end_iter(), False)
-            self.text_view.scroll_to_mark(end_mark, 0.0, False, 0.0, 1.0)
+            self.text_view.scroll_to_mark(self._end_mark, 0.0, False, 0.0, 1.0)
 
     def _on_copy_clicked(self, _btn):
         raw = self.buffer.get_text(self.buffer.get_start_iter(), self.buffer.get_end_iter(), True)
@@ -424,6 +530,16 @@ class GameLogsView(Gtk.Box):
             _toast(self.window.toasts, _("Logs copied to clipboard"))
 
     def _on_clear_clicked(self, _btn):
+        if self._drain_id:
+            GLib.source_remove(self._drain_id)
+            self._drain_id = 0
+        self._pending.clear()
+        self._discard_line = False
+        if self.current_log_path:
+            try:
+                self.last_pos = self.current_log_path.stat().st_size
+            except OSError:
+                pass
         self.buffer.set_text("")
         self.line_count = 0
         self.close_search()
@@ -1218,7 +1334,7 @@ class SettingsPage(Adw.Bin):
         diagnostics = Adw.PreferencesGroup(
             title=_("Diagnostics"),
             description=_("Detailed logs for debugging. They slow the game down, enable only when needed."))
-        for key, title in [("diagnostic_signals", "Backtrace on crashes"),
+        for key, title in [("diagnostic_signals", "Crash diagnostics"),
                            ("trace_udp", "Network tracing (UDP)"),
                            ("trace_lock", "Mouse lock tracing"),
                            ("trace_events", "Mouse event tracing"),
@@ -2383,15 +2499,29 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.set_setting("show_playtime", enabled)
         self.play_page.refresh_playtime()
 
-    def _on_game_activity_change(self, info: dict | None):
+    def _on_game_activity_change(self, info: dict | None, session, tracker, generation):
+        # The log and metadata workers only enqueue; GTK-owned state changes
+        # after checking that this callback still belongs to the active launch.
+        GLib.idle_add(self._apply_game_activity_change, info, session, tracker, generation)
+
+    def _apply_game_activity_change(self, info, session, tracker, generation):
+        if (self.session is not session or self.game_tracker is not tracker or
+                not self.settings.get("discord_rpc", True) or
+                not tracker.is_current_generation(generation)):
+            return False
         self.current_game_info = info
-        GLib.idle_add(self._refresh_rpc_presence)
+        self._refresh_rpc_presence()
+        return False
 
     def _refresh_rpc_presence(self):
-        if not self.settings.get("discord_rpc", True):
-            return
-        if getattr(self, "rpc", None) is None:
-            self.rpc = discord.DiscordRPC()
+        if not self.session or not self.settings.get("discord_rpc", True):
+            return False
+        if self.rpc is None or self.rpc.closed:
+            try:
+                self.rpc = discord.DiscordRPC()
+            except RuntimeError as error:
+                print("Could not start Discord presence worker:", error)
+                return False
         rpc = self.rpc
         start = (
             getattr(self, "game_started_at", time.time())
@@ -2427,7 +2557,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             small_image = None
             small_text = None
 
-        threading.Thread(target=lambda: rpc.update_presence(
+        rpc.queue_presence(
             details=details,
             state=state,
             start_time=start,
@@ -2435,20 +2565,37 @@ class LauncherWindow(Adw.ApplicationWindow):
             large_text=large_text,
             small_image=small_image,
             small_text=small_text,
-        ), daemon=True).start()
+        )
+        return False
 
     def _start_rpc(self):
+        session = self.session
+        if not session or not self.settings.get("discord_rpc", True):
+            return
+        if self.game_tracker is None and session.log_path:
+            tracker = discord.GameActivityTracker(
+                session.log_path,
+                lambda info, generation: self._on_game_activity_change(
+                    info, session, tracker, generation),
+                autostart=False,
+            )
+            self.game_tracker = tracker
+            try:
+                tracker.start()
+            except RuntimeError as error:
+                self.game_tracker = None
+                print("Could not start Discord game tracker:", error)
         self._refresh_rpc_presence()
 
     def _stop_rpc(self):
-        if getattr(self, "game_tracker", None):
-            self.game_tracker.stop()
-            self.game_tracker = None
+        tracker, self.game_tracker = self.game_tracker, None
+        if tracker:
+            tracker.stop()
         self.current_game_info = None
         if getattr(self, "rpc", None):
             rpc = self.rpc
             self.rpc = None
-            threading.Thread(target=rpc.close, daemon=True).start()
+            rpc.close()
 
     def _started(self, session, error):
         self.busy = None
@@ -2461,6 +2608,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.play_page.refresh()
             _error_dialog(self, _("Could not start Roblox"), str(error) or repr(error))
             return
+        self._stop_rpc()
         self.session = session
         if session.launch_uri:
             # A newer click may have replaced pending-uri while Darling was
@@ -2477,29 +2625,52 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.play_page.refresh()
         if self.settings.get("discord_rpc", True):
             self._start_rpc()
-        if self.session and self.session.log_path:
-            self.game_tracker = discord.GameActivityTracker(
-                self.session.log_path,
-                self._on_game_activity_change
-            )
         # Hide once the game window has had time to appear.
         GLib.timeout_add_seconds(3, self._hide_while_playing)
-        GLib.timeout_add(1000, self._watch)
+        GLib.timeout_add(1000, self._watch, session)
 
     def _hide_while_playing(self):
         if self.session and self.settings.get("hide_launcher_on_launch", True):
             self.set_visible(False)
         return False
 
-    def _watch(self):
-        if not self.session:
+    def _watch(self, session):
+        # A timer belongs to one launch. It must never start polling a new
+        # session if the previous one finished between timer turns.
+        if self.session is not session:
             return False
+        if getattr(self, "_watch_inflight", None) is not None:
+            return True
+        self._watch_inflight = session
+
+        def poll():
+            try:
+                status = session.poll()
+            except Exception as error:
+                print("Watching the game failed:", error)
+                try:
+                    session.finish()
+                    status = -1
+                except Exception as cleanup_error:
+                    # Keep ownership of this session until cleanup succeeds;
+                    # the next timer turn retries without overlapping launches.
+                    print("Cleaning up the game failed:", cleanup_error)
+                    status = None
+            GLib.idle_add(self._watch_result, session, status)
+
         try:
-            status = self.session.poll()
-        except Exception as error:  # an exception here would stop this timer for good
-            print("Watching the game failed:", error)
-            self.session.finish()
-            status = -1
+            threading.Thread(target=poll, daemon=True).start()
+        except RuntimeError as error:
+            self._watch_inflight = None
+            print("Could not start game watcher:", error)
+        return True
+
+    def _watch_result(self, session, status):
+        """Apply worker results on GTK's thread after polling/cleanup returns."""
+        if getattr(self, "_watch_inflight", None) is session:
+            self._watch_inflight = None
+        if self.session is not session:
+            return False
         if status is None:
             # Active game: track playtime
             self.settings["playtime_seconds"] = self.settings.get("playtime_seconds", 0) + 1
@@ -2513,9 +2684,9 @@ class LauncherWindow(Adw.ApplicationWindow):
             # Retry RPC connection if Discord was launched after the game
             if self.settings.get("discord_rpc", True):
                 rpc = getattr(self, "rpc", None)
-                if rpc and not rpc._connected and int(self.settings["playtime_seconds"]) % 5 == 0:
+                if (rpc is None or not rpc.connected) and int(self.settings["playtime_seconds"]) % 5 == 0:
                     self._start_rpc()
-            return True
+            return False
         self.session = None
         self._stop_web()
         self._stop_rpc()

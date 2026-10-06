@@ -78,6 +78,24 @@ extern int poll(struct pollfd *, unsigned int, int);
 #define POLLHUP 16
 extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id, long, BOOL, const void *);
 
+/* Darling currently accepts SO_NOSIGPIPE without applying it, and strips
+ * MSG_NOSIGNAL from translated send(). This private socket is a Linux FD:
+ * sendto directly with per-call Linux flags, without changing process signal
+ * handlers. Keep the raw negative Linux errno for the caller to classify. */
+#define WEB_LINUX_EAGAIN 11
+#define WEB_LINUX_EINTR 4
+static long bridgeSocketSend(int fd, const void* bytes, unsigned long length) {
+    register long flags __asm__("r10") = 0x40 | 0x4000; // DONTWAIT | NOSIGNAL
+    register long address __asm__("r8") = 0;
+    register long addressLength __asm__("r9") = 0;
+    long result;
+    __asm__ volatile("syscall" : "=a"(result)
+        : "a"(44L), "D"((long)fd), "S"(bytes), "d"(length),
+          "r"(flags), "r"(address), "r"(addressLength)
+        : "rcx", "r11", "memory", "cc");
+    return result;
+}
+
 @interface NSObject { Class isa; }
 + (id)alloc; + (id)new; + (Class)class; - (id)init; - (id)copy; - (id)mutableCopy;
 - (id)retain; - (void)release; - (id)autorelease; - (void)dealloc;
@@ -90,6 +108,7 @@ extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id,
 @interface NSNumber : NSObject
 + (id)numberWithLong:(long)value; + (id)numberWithBool:(BOOL)value; + (id)numberWithDouble:(double)value;
 + (id)numberWithInt:(int)value; + (id)numberWithUnsignedLong:(unsigned long)value;
++ (id)numberWithUnsignedInteger:(NSUInteger)value;
 - (long)longValue; - (BOOL)boolValue; - (double)doubleValue;
 @end
 @interface NSArray : NSObject
@@ -106,6 +125,7 @@ extern const void *CFURLCreateWithFileSystemPathRelativeToBase(const void *, id,
 + (id)dictionary;
 + (id)dictionaryWithObjects:(const id *)objects forKeys:(const id *)keys count:(NSUInteger)count;
 - (id)objectForKey:(id)key; - (id)objectForKeyedSubscript:(id)key; - (NSArray *)allKeys;
+- (NSUInteger)count;
 @end
 @interface NSMutableDictionary : NSDictionary
 + (id)dictionary; + (id)dictionaryWithDictionary:(NSDictionary *)other;
@@ -203,8 +223,33 @@ static NSMutableArray *outgoing;
 static NSWindow *gameWindow;
 static NSMutableDictionary *views, *callbacks;
 static long nextView, nextRequest;
+static NSUInteger outgoingBytes;
+static unsigned long long bridgeGeneration;
+static BOOL bridgeReadClosed;
+#define WEB_FRAME_BYTES (1024UL * 1024UL)
+#define WEB_QUEUE_BYTES (2UL * WEB_FRAME_BYTES)
+#define WEB_PENDING_LIMIT 128UL
+#define WEB_TURN_BYTES (64UL * 1024UL)
+#define WEB_TURN_MESSAGES 32UL
 static void receiveMessage(NSDictionary *message);
 static void failRequests(id view, NSString *reason);
+
+/* The registry locates a view; the caller and its AppKit parent own it.
+ * A strong registry would keep an unused, never-attached view alive forever. */
+@interface MacOBloxWeakWebView : NSObject { id _value; }
+- (id)initWithValue:(id)value;
+- (id)value;
+@end
+@implementation MacOBloxWeakWebView
+- (id)initWithValue:(id)value {
+    self = [super init];
+    if (self) objc_storeWeak(&_value, value);
+    return self;
+}
+- (id)value { return [objc_loadWeakRetained(&_value) autorelease]; }
+- (void)dealloc { objc_destroyWeak(&_value); [super dealloc]; }
+@end
+static id bridgeView(id number) { return number ? [views[number] value] : nil; }
 
 static double bridgeTime(void) { return [[NSDate date] timeIntervalSince1970]; }
 static void initializeBridge(void) {
@@ -217,11 +262,16 @@ static void disconnectBridge(NSString *reason) {
     if (connection >= 0) close(connection);
     connection = -1;
     connecting = NO;
+    bridgeReadClosed = NO;
+    __atomic_add_fetch(&bridgeGeneration, 1, __ATOMIC_RELAXED);
     retryAfter = bridgeTime() + 1.0;
     /* Frames belong to one stream. A suffix from a partial write must never
      * be replayed on a new connection as though it were a complete JSON line. */
     [received setLength:0];
     [outgoing removeAllObjects];
+    outgoingBytes = 0;
+    [gameWindow release];
+    gameWindow = nil;
     failRequests(nil, reason);
 }
 
@@ -234,16 +284,26 @@ static BOOL sendMessage(NSDictionary *message) {
     if (!socketPath())
         return NO;
     if (![NSThread isMainThread]) {
-        dispatch_async(&_dispatch_main_q, ^{ sendMessage(message); });
+        unsigned long long generation = __atomic_load_n(&bridgeGeneration, __ATOMIC_RELAXED);
+        dispatch_async(&_dispatch_main_q, ^{
+            if (generation == __atomic_load_n(&bridgeGeneration, __ATOMIC_RELAXED))
+                sendMessage(message);
+        });
         return YES;
     }
     initializeBridge();
     NSData *json = [NSJSONSerialization dataWithJSONObject:message options:0 error:0];
-    if (!json || [json length] > 1024 * 1024 || [outgoing count] >= 128)
+    if (!json || [json length] + 1 > WEB_FRAME_BYTES)
         return NO;
+    if ([outgoing count] >= WEB_PENDING_LIMIT ||
+        [json length] + 1 > WEB_QUEUE_BYTES - outgoingBytes) {
+        disconnectBridge(@"The embedded browser queue exceeded its limit.");
+        return NO;
+    }
     NSMutableData *line = [json mutableCopy];
     [line appendBytes:"\n" length:1];
     [outgoing addObject:line];
+    outgoingBytes += [line length];
     [line release];
     return YES;
 }
@@ -362,10 +422,12 @@ static void closeHostedView(id self, SEL selector) {
             }
         }
     }
-    while ([outgoing count]) {
+    NSUInteger writeBudget = WEB_TURN_BYTES, writeMessages = WEB_TURN_MESSAGES;
+    while (!bridgeReadClosed && [outgoing count] && writeBudget && writeMessages) {
         NSMutableData *line = [outgoing objectAtIndex:0];
-        long n = write(connection, [line bytes], [line length]);
-        if (n < 0 && (errno == EAGAIN || errno == EINTR))
+        NSUInteger length = [line length] < writeBudget ? [line length] : writeBudget;
+        long n = bridgeSocketSend(connection, [line bytes], length);
+        if (n == -WEB_LINUX_EAGAIN || n == -WEB_LINUX_EINTR)
             break;
         if (n <= 0) {
             disconnectBridge(@"The embedded browser disconnected.");
@@ -373,29 +435,55 @@ static void closeHostedView(id self, SEL selector) {
         }
         NSRange done = {0, (NSUInteger)n};
         [line replaceBytesInRange:done withBytes:0 length:0];
-        if (![line length])
+        outgoingBytes -= (NSUInteger)n;
+        writeBudget -= (NSUInteger)n;
+        if (![line length]) {
             [outgoing removeObjectAtIndex:0];
+            writeMessages--;
+        }
     }
     char buffer[8192];
-    long n;
-    while ((n = read(connection, buffer, sizeof buffer)) > 0)
+    NSUInteger readBudget = WEB_TURN_BYTES;
+    while (!bridgeReadClosed && readBudget) {
+        NSUInteger length = readBudget < sizeof buffer ? readBudget : sizeof buffer;
+        long n = read(connection, buffer, length);
+        if (n < 0 && (errno == EAGAIN || errno == EINTR))
+            break;
+        if (n <= 0) {
+            bridgeReadClosed = YES;
+            break;
+        }
+        if ((NSUInteger)n > WEB_QUEUE_BYTES - [received length]) {
+            disconnectBridge(@"The embedded browser receive queue exceeded its limit.");
+            return;
+        }
         [received appendBytes:buffer length:(NSUInteger)n];
-    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR) || [received length] > 1024 * 1024) {
-        disconnectBridge(@"The embedded browser disconnected.");
-        return;
+        readBudget -= (NSUInteger)n;
     }
-    for (;;) {
+    unsigned long long generation = __atomic_load_n(&bridgeGeneration, __ATOMIC_RELAXED);
+    for (NSUInteger handled = 0; handled < WEB_TURN_MESSAGES; handled++) {
         const char *bytes = [received bytes];
         const char *end = memchr(bytes, '\n', [received length]);
-        if (!end)
+        if (!end) {
+            if ([received length] > WEB_FRAME_BYTES)
+                disconnectBridge(@"The embedded browser frame exceeded its limit.");
+            else if (bridgeReadClosed)
+                disconnectBridge(@"The embedded browser disconnected.");
             break;
+        }
         NSUInteger length = (NSUInteger)(end - bytes);
+        if (length + 1 > WEB_FRAME_BYTES) {
+            disconnectBridge(@"The embedded browser frame exceeded its limit.");
+            return;
+        }
         NSData *line = [NSData dataWithBytes:bytes length:length];
         NSRange consumed = {0, length + 1};
         [received replaceBytesInRange:consumed withBytes:0 length:0];
         id message = [NSJSONSerialization JSONObjectWithData:line options:0 error:0];
         if ([message isKindOfClass:[NSDictionary class]])
             receiveMessage(message);
+        if (generation != __atomic_load_n(&bridgeGeneration, __ATOMIC_RELAXED))
+            return;
     }
 }
 @end
@@ -514,6 +602,11 @@ static BOOL validUserAgent(NSString *agent) {
 }
 static void enqueueRequest(long number, NSMutableDictionary *message, void (^completion)(id, NSError *)) {
     initializeBridge();
+    if (completion && [callbacks count] >= WEB_PENDING_LIMIT) {
+        completion(nil, [NSError errorWithDomain:@"MacOBloxWeb" code:1
+            userInfo:@{NSLocalizedDescriptionKey: @"Too many pending browser requests."}]);
+        return;
+    }
     if (completion) {
         id block = (id)_Block_copy(completion);
         callbacks[@(number)] = @{@"block": block, @"deadline": @(bridgeTime() + 15.0),
@@ -526,9 +619,21 @@ static void enqueueRequest(long number, NSMutableDictionary *message, void (^com
 }
 static long request(NSMutableDictionary *message, void (^completion)(id, NSError *)) {
     long number = __atomic_add_fetch(&nextRequest, 1, __ATOMIC_RELAXED);
-    if ([NSThread isMainThread]) enqueueRequest(number, message, completion);
-    else dispatch_async(&_dispatch_main_q, ^{ enqueueRequest(number, message, completion); });
-    [message release];
+    @try {
+        if ([NSThread isMainThread]) enqueueRequest(number, message, completion);
+        else {
+            unsigned long long generation = __atomic_load_n(&bridgeGeneration, __ATOMIC_RELAXED);
+            dispatch_async(&_dispatch_main_q, ^{
+                if (generation == __atomic_load_n(&bridgeGeneration, __ATOMIC_RELAXED))
+                    enqueueRequest(number, message, completion);
+                else if (completion)
+                    completion(nil, [NSError errorWithDomain:@"MacOBloxWeb" code:1
+                        userInfo:@{NSLocalizedDescriptionKey: @"The embedded browser disconnected."}]);
+            });
+        }
+    } @finally {
+        [message release];
+    }
     return number;
 }
 static void failRequests(id view, NSString *reason) {
@@ -704,9 +809,9 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
     self = [super initWithFrame:frame];
     if (self) {
         initializeBridge();
-        _id = ++nextView;
+        _id = __atomic_add_fetch(&nextView, 1, __ATOMIC_RELAXED);
         _configuration = [configuration retain];
-        views[@(_id)] = self;
+        views[@(_id)] = [[[MacOBloxWeakWebView alloc] initWithValue:self] autorelease];
     }
     return self;
 }
@@ -749,6 +854,7 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
         NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:stateFor([scripts objectAtIndex:i])];
         m[@"op"] = @"script";
         m[@"view"] = @(_id);
+        m[@"scriptId"] = @(i);
         delivered &= sendMessage(m);
     }
     [_navigation release];
@@ -770,7 +876,7 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
         id navigation = _navigation;
         dispatch_async(&_dispatch_main_q, ^{
             // Another load or a closed view supersedes this navigation.
-            if (views[@(_id)] != self || _navigation != navigation)
+            if (bridgeView(@(_id)) != self || _navigation != navigation)
                 return;
             _loading = NO;
             id currentDelegate = [self navigationDelegate];
@@ -793,20 +899,24 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
     BOOL attached = [self window] != nil;
-    if (_attached && !attached)
-        [self macobloxCloseHostedView];
+    BOOL closed = _attached && !attached;
     _attached = attached;
+    if (closed)
+        [self macobloxCloseHostedView];
 }
 - (void)macobloxCloseHostedView {
-    if (views[@(_id)] != self)
+    if (bridgeView(@(_id)) != self)
         return;
     [self retain];
-    sendMessage(@{@"op": @"close", @"view": @(_id)});
-    [self setNavigationDelegate:nil];
-    [self setUIDelegate:nil];
-    [views removeObjectForKey:@(_id)];
-    failRequests(@(_id), @"The embedded page was closed.");
-    [self release];
+    @try {
+        sendMessage(@{@"op": @"close", @"view": @(_id)});
+        [self setNavigationDelegate:nil];
+        [self setUIDelegate:nil];
+        [views removeObjectForKey:@(_id)];
+        failRequests(@(_id), @"The embedded page was closed.");
+    } @finally {
+        [self release];
+    }
 }
 - (void)removeFromSuperview {
     if ([self superview])
@@ -814,6 +924,17 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
     [super removeFromSuperview];
 }
 - (void)dealloc {
+    // Never retain or invoke a delegate through an object being destroyed.
+    // Numeric IDs are unique for this process and safe in the queued cleanup.
+    long number = _id;
+    dispatch_async(&_dispatch_main_q, ^{
+        id key = @(number);
+        if (views[key]) {
+            [views removeObjectForKey:key];
+            sendMessage(@{@"op": @"close", @"view": key});
+            failRequests(key, @"The embedded page was closed.");
+        }
+    });
     objc_destroyWeak(&_navigationDelegate);
     objc_destroyWeak(&_UIDelegate);
     [_configuration release]; [_URL release]; [_title release]; [_navigation release];
@@ -824,6 +945,11 @@ static id webViewAllocWithZone(id cls, SEL selector, void *zone) {
 static void receiveMessage(NSDictionary *message) {
     NSString *type = message[@"event"];
     if ([type isEqual:@"launch-url"]) {
+        id number = message[@"view"];
+        // View zero is the standalone NSWorkspace browser. A closed hosted
+        // page must not deliver a launch link already queued on this stream.
+        if (!number || ([number longValue] != 0 && !bridgeView(number)))
+            return;
         if (deliverClientURL(message[@"url"]))
             sendMessage(@{@"op": @"return-to-game"});
         else
@@ -834,18 +960,22 @@ static void receiveMessage(NSDictionary *message) {
         id key = message[@"request"];
         if (!key)
             return;
-        void (^block)(id, NSError *) = (void (^)(id, NSError *))_Block_copy(callbacks[key][@"block"]);
+        id stored = callbacks[key][@"block"];
+        void (^block)(id, NSError *) = stored ? (void (^)(id, NSError *))_Block_copy(stored) : 0;
         [callbacks removeObjectForKey:key];
         if (block) {
             NSError *error = message[@"error"]
                 ? [NSError errorWithDomain:@"MacOBloxWeb" code:1 userInfo:@{NSLocalizedDescriptionKey: message[@"error"]}]
                 : nil;
-            block(message[@"value"], error);
-            _Block_release(block);
+            @try {
+                block(message[@"value"], error);
+            } @finally {
+                _Block_release(block);
+            }
         }
         return;
     }
-    MacOBloxWebView *view = views[message[@"view"]];
+    MacOBloxWebView *view = bridgeView(message[@"view"]);
     if (!view)
         return;
     id delegate = [view navigationDelegate];
@@ -873,8 +1003,10 @@ static void receiveMessage(NSDictionary *message) {
         if (action->_type == 5)
             action->_type = -1;
         id decision = message[@"decision"];
+        unsigned long long generation = __atomic_load_n(&bridgeGeneration, __ATOMIC_RELAXED);
         void (^decide)(long) = ^(long allow) {
-            sendMessage(@{@"op": @"policy", @"decision": decision ?: @0, @"allow": @(allow != 0)});
+            if (generation == __atomic_load_n(&bridgeGeneration, __ATOMIC_RELAXED))
+                sendMessage(@{@"op": @"policy", @"decision": decision ?: @0, @"allow": @(allow != 0)});
         };
         if ([delegate respondsToSelector:@selector(webView:decidePolicyForNavigationAction:decisionHandler:)])
             [delegate webView:view decidePolicyForNavigationAction:action decisionHandler:decide];

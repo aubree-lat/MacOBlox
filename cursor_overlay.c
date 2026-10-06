@@ -79,6 +79,7 @@ static CursorVisual visual;
 static XID overlay, parent, colormap;
 static int anchor_x, anchor_y;
 static unsigned long last_serial;
+static unsigned long lock_generation;
 static CursorErrorHandler previous_error_handler;
 static void *(*host_calloc)(unsigned long, unsigned long);
 static void (*host_free)(void *);
@@ -146,8 +147,12 @@ static int resolve(void) {
 }
 
 /* Called before XFixesHideCursor on lock entry, and again on cursor changes.
- * A transparent cursor stays transparent; a game's custom cursor is kept. */
-int macoblox_cursor_overlay_update(int locked, XID game_window, int visible) {
+ * A transparent cursor stays transparent; a game's custom cursor is kept.
+ * Production calls pass the native position sampled at capture entry. The
+ * worker may run after motion/recentering, so cursor->x/y are not that point. */
+static int cursor_overlay_update(int locked, XID game_window, int visible,
+                                 int saved_position, int saved_x, int saved_y,
+                                 unsigned long generation) {
     if (!locked || !game_window) {
         if (display && overlay) {
             p_XUnmapWindow(display, overlay);
@@ -155,6 +160,7 @@ int macoblox_cursor_overlay_update(int locked, XID game_window, int visible) {
         }
         parent = 0;
         last_serial = 0;
+        lock_generation = 0;
         return 1;
     }
     if (!resolve()) return 0;
@@ -166,7 +172,9 @@ int macoblox_cursor_overlay_update(int locked, XID game_window, int visible) {
     }
     CursorImage *cursor = p_XFixesGetCursorImage(display);
     if (!cursor) return 0;
-    if (parent == game_window && last_serial == cursor->serial) {
+    int anchor_changed = saved_position &&
+        (lock_generation != generation || anchor_x != saved_x || anchor_y != saved_y);
+    if (parent == game_window && last_serial == cursor->serial && !anchor_changed) {
         p_XFree(cursor);
         return 1;
     }
@@ -175,13 +183,19 @@ int macoblox_cursor_overlay_update(int locked, XID game_window, int visible) {
         p_XFree(cursor);
         return 0;
     }
-    if (parent != game_window) {
+    if (saved_position) {
+        anchor_x = saved_x;
+        anchor_y = saved_y;
+        lock_generation = generation;
+    } else if (parent != game_window) {
         XID child;
         if (!p_XTranslateCoordinates(display, p_XDefaultRootWindow(display), game_window,
                                      cursor->x, cursor->y, &anchor_x, &anchor_y, &child)) {
             p_XFree(cursor);
             return 0;
         }
+    }
+    if (parent != game_window) {
         if (overlay) p_XDestroyWindow(display, overlay);
         CursorAttributes attributes = {0};
         attributes.colormap = colormap;
@@ -235,4 +249,15 @@ int macoblox_cursor_overlay_update(int locked, XID game_window, int visible) {
     free(rects);
     p_XFlush(display);
     return 1;
+}
+
+int macoblox_cursor_overlay_update_at(int locked, XID game_window, int visible,
+                                      int saved_x, int saved_y, unsigned long generation) {
+    return cursor_overlay_update(locked, game_window, visible, 1, saved_x, saved_y, generation);
+}
+
+/* Keep the standalone helper interface for callers without a capture
+ * snapshot. The game shim always uses update_at with the saved position. */
+int macoblox_cursor_overlay_update(int locked, XID game_window, int visible) {
+    return cursor_overlay_update(locked, game_window, visible, 0, 0, 0, 0);
 }

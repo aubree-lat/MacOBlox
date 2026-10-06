@@ -1,5 +1,76 @@
 # Release notes
 
+## Unreleased
+
+### Input fixes
+
+- Pair custom Roblox UI scaling with absolute mouse-position compensation to
+  correct the growing click offset at 200% and other custom scales. Preserve
+  raw camera deltas and native cursor coordinates. Unsupported client input
+  layouts skip custom scaling and report the reason in the launch log.
+- Confine camera capture to the native game window, use absolute recentering,
+  and restore the saved pointer position on unlock. Release capture on focus
+  loss and window teardown; correct the X11 focus-event window field.
+  Apply capture changes on the event thread, acknowledge cursor hiding for
+  each lock transition, and recover from cursor-worker connection failures.
+- Supply real attributed text substrings for Roblox's composition offsets and
+  repair Darling's collapsed-selection anchor in the Roblox text handler.
+- Add optional `MACOBLOX_TRACE_TEXT_INPUT=1` diagnostics for typing reports.
+  They record lengths, ranges and composition state without typed content.
+
+### Crash diagnostics
+
+- Record session lifecycle state before cleanup, identify packaging and client
+  version, and prevent guest log writes from overwriting lifecycle records.
+  Preserve Darling warmup output and its exit status in the launch log.
+- Expand opt-in fatal signal coverage and remove unsafe stack scans and
+  signal-time symbol lookup. Record registers and bounded window-startup
+  call markers; rename the setting to **Crash diagnostics**.
+- Correct misleading EGL retry messages: report whether a retry occurred,
+  its actual error, and the native window ID.
+
+### Stability and responsiveness
+
+- Bound embedded-browser socket work per UI turn and cap queued frames,
+  callbacks, pages and injected scripts. Dispose old pages and cancel pending
+  work on disconnect; reject stale replies after a new game session connects.
+  Release unused guest web views and suppress SIGPIPE on private socket writes.
+- Serialize Discord IPC, coalesce presence updates on one worker, and disconnect
+  after incomplete replies. Keep one metadata worker per tracker, atomically
+  save a bounded game cache, and ignore activity callbacks from ended sessions.
+  Start tracking only while Rich Presence is enabled and restart it on enable.
+- Include queued DNS work in the upstream deadline and cap pending queries.
+  Close active connections on shutdown, bound custom hostname lookups, and honor
+  short/zero DNS TTLs with aged cached replies.
+- Limit live-log reading and highlighting per UI update, retain fragmented
+  UTF-8 lines, and bound displayed text and search matches. Reuse the scroll
+  mark and preserve the selected search match during automatic updates.
+- Skip unchanged X11 drawable geometry and visibility requests after validating
+  the backend ABI and native-window identity. Preserve OpenGL context preparation
+  and invalidate cached state after off-main-thread changes.
+- Bound private X11 setup/visual queries to 250 ms and pointer snapshots/cursor
+  transitions to 100 ms. Retry interrupted I/O, limit reply sizes, suppress
+  SIGPIPE, and move the one-time Xauthority lookup off input/render callers.
+- Read shader diagnostic sources from the current GL context instead of a
+  process-global shader-name cache. Cap diagnostic allocations and avoid extra
+  compilation-status waits when shader tracing is disabled.
+- Make watchdog location capture signal-safe with atomic request ownership.
+  Record only the interrupted instruction pointer without scanning application
+  stacks or taking dynamic-loader locks.
+- Poll and clean up game sessions outside GTK's main thread. Keep one watcher
+  per launch and ignore callbacks from old sessions.
+- Roll back partially initialized host audio, make audio shutdown idempotent,
+  and reap microphone recorders after a forced shutdown.
+- Recognize rootless Flatpak guests and orphans from their loader and mapped
+  prefix runtime files, restoring game tracking and scoped cleanup without
+  treating the shared sandbox mount namespace as ownership evidence.
+
+The ordinary-character deletion report and the exact failures in the two
+new user logs remain under investigation. The native shim, Wayland helper and
+framework stubs build successfully; changed Python sources parse successfully.
+This stability/performance pass has not run gameplay checks or benchmarks, and
+these changes have not been verified on the reporting users' hardware.
+
 ## 0.19 — 2026-10-04
 
 ### Bug fixes and settings

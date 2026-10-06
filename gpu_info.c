@@ -100,9 +100,10 @@ DYLD_INTERPOSE(macoblox_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCF
  * Fedora KDE user's client into an endless updateSurfaceLuaApp loop until
  * the stack overflowed. Answer the size at 96 DPI of the display's bounds,
  * of the main display for an unknown ID, or of 1920x1080 before AppKit has
- * screens. MACOBLOX_DPI_SCALE multiplies the inferred DPI without changing
- * rendering or input coordinates. Unknown IDs get the main display's bounds
- * too. */
+ * screens. Requested UI scaling is applied by the paired client surface and
+ * mouse hooks; this physical-size repair stays at 96 DPI so an unsupported
+ * input ABI cannot leave a separate synthetic scale active. Unknown IDs get
+ * the main display's bounds too. */
 typedef struct { double x, y, width, height; } macoblox_rect; /* CGRect */
 typedef struct { double width, height; } macoblox_size;       /* CGSize */
 __attribute__((weak_import)) extern macoblox_rect CGDisplayBounds(unsigned int);
@@ -156,7 +157,7 @@ static macoblox_size macoblox_CGDisplayScreenSize(unsigned int display) {
     macoblox_rect bounds = macoblox_CGDisplayBounds(display);
     double width = __builtin_isfinite(bounds.width) && bounds.width > 0 ? bounds.width : 1920;
     double height = __builtin_isfinite(bounds.height) && bounds.height > 0 ? bounds.height : 1080;
-    double millimetres_per_pixel = 25.4 / (96.0 * macoblox_dpi_scale());
+    double millimetres_per_pixel = 25.4 / 96.0;
     macoblox_size size = {width * millimetres_per_pixel, height * millimetres_per_pixel};
     if (!(size.width > 0)) size.width = 1920 * millimetres_per_pixel;
     if (!(size.height > 0)) size.height = 1080 * millimetres_per_pixel;
