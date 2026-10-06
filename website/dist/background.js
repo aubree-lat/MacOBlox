@@ -10,7 +10,7 @@
   try {
     effect = window.VANTA.TOPOLOGY({el: element, p5: window.p5, mouseControls: !paused,
       touchControls: !paused, gyroControls: false, minHeight: 200, minWidth: 200,
-      scale: 1, scaleMobile: 1, color: 0x6e6e6e, backgroundColor: 0x0});
+      scale: 1, scaleMobile: 1, color: 0xb400ff, backgroundColor: 0x2a});
   } catch { return; }
   function apply() {
     const sketch = effect.p5;
