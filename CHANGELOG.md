@@ -1,9 +1,13 @@
 # Release notes
 
-## Unreleased
+## 0.20 — 2026-10-05
 
 ### Input fixes
 
+- Replace the successful empty Carbon key-label translation with a valid ANSI
+  fallback layout and bounded printable-key translation. This repairs the
+  missing keyboard labels used by Roblox's E-key interaction prompts on both
+  rendering backends; normal AppKit text input keeps its existing path.
 - Pair custom Roblox UI scaling with absolute mouse-position compensation to
   correct the growing click offset at 200% and other custom scales. Preserve
   raw camera deltas and native cursor coordinates. Unsupported client input
@@ -31,6 +35,17 @@
 
 ### Stability and responsiveness
 
+- Add **Graphics card** under Game settings when multiple GPUs are detected.
+  Store PCI identities, apply Mesa/NVIDIA PRIME selection to both the host
+  probe and Darwin game, and use the selected adapter's measured VRAM budget.
+  Automatic preserves desktop/terminal selections; unavailable stored adapters
+  produce an actionable error instead of silently choosing another GPU. Clear
+  stale Darling GPU selectors before restoring each session's selection.
+- Recognize Roblox quitting for a required update even when it exits through
+  the normal quit sentinel. Offer a fresh official-client download and keep
+  pending game links until update recovery completes.
+- Forward the host configuration directory to Linux graphics layers, avoiding
+  attempts by layers such as LSFG to create settings under Darwin's `/Users`.
 - Bound embedded-browser socket work per UI turn and cap queued frames,
   callbacks, pages and injected scripts. Dispose old pages and cancel pending
   work on disconnect; reject stale replies after a new game session connects.
@@ -65,11 +80,23 @@
   prefix runtime files, restoring game tracking and scoped cleanup without
   treating the shared sandbox mount namespace as ownership evidence.
 
-The ordinary-character deletion report and the exact failures in the two
-new user logs remain under investigation. The native shim, Wayland helper and
-framework stubs build successfully; changed Python sources parse successfully.
-This stability/performance pass has not run gameplay checks or benchmarks, and
-these changes have not been verified on the reporting users' hardware.
+### Packaging
+
+This is a source release. No Flatpak bundle is included in 0.20.
+
+### Verification and remaining work
+
+The native shim, Wayland helper and framework stubs build successfully;
+changed Python sources parse successfully. This stability/performance pass
+has not run gameplay checks or benchmarks, and these changes have not been
+verified on the reporting users' hardware. E-key prompt visibility and hybrid
+laptop GPU offloading still need gameplay confirmation. Keyboard labels use
+an ANSI fallback; selecting among multiple proprietary NVIDIA cards with
+OpenGL requires an X11 provider selection.
+
+The ordinary-character deletion report, the two previously reported crashes,
+the pause after leaving games and intermittent graphics stutters remain under
+investigation. Native Wayland remains experimental; Vulkan still uses Zink.
 
 ## 0.19 — 2026-10-04
 

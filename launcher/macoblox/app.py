@@ -1167,6 +1167,18 @@ class SettingsPage(Adw.Bin):
         renderer_handler = renderer.connect("notify::selected", select_renderer)
         game.add(renderer)
 
+        self._gpu_codes = ["auto"]
+        self.gpu_row = Adw.ComboRow(
+            title=_("Graphics card"),
+            subtitle=_("Detecting graphics cards… Applies on next launch."),
+            model=Gtk.StringList.new([_("Automatic")]),
+            sensitive=False,
+            visible=settings.get("gpu", "auto") != "auto")
+        self._gpu_handler = self.gpu_row.connect("notify::selected", self._select_gpu)
+        game.add(self.gpu_row)
+        from . import gpus
+        self._in_thread(gpus.enumerate_gpus, self._gpu_choices_loaded)
+
         backend_codes = ["x11", "wayland"]
         backend = Adw.ComboRow(
             title=_("Window backend"),
@@ -1443,6 +1455,34 @@ class SettingsPage(Adw.Bin):
         if hasattr(self, "raw_mouse_row"):
             self.raw_mouse_row.set_active(self.window.settings.get("raw_mouse", True))
 
+    def _select_gpu(self, row, _pspec):
+        selected = row.get_selected()
+        if selected < len(self._gpu_codes):
+            self.window.set_setting("gpu", self._gpu_codes[selected])
+
+    def _gpu_choices_loaded(self, adapters, error):
+        if getattr(self.window, "settings_page", None) is not self:
+            return False
+        selection = self.window.settings.get("gpu", "auto")
+        adapters = adapters or []
+        codes = ["auto", *(adapter["id"] for adapter in adapters)]
+        labels = [_("Automatic"), *(adapter["label"] for adapter in adapters)]
+        if selection not in codes:
+            codes.append(selection)
+            labels.append(_("Selected graphics card unavailable"))
+        self._gpu_codes = codes
+        self.gpu_row.handler_block(self._gpu_handler)
+        try:
+            self.gpu_row.set_model(Gtk.StringList.new(labels))
+            self.gpu_row.set_selected(codes.index(selection))
+        finally:
+            self.gpu_row.handler_unblock(self._gpu_handler)
+        self.gpu_row.set_sensitive(True)
+        self.gpu_row.set_visible(len(adapters) > 1 or selection != "auto" or error is not None)
+        self.gpu_row.set_subtitle(_("Could not detect graphics cards. Select Automatic to use the system default.")
+                                  if error else _("Applies on next launch. Automatic keeps your desktop or terminal's GPU selection."))
+        return False
+
     def open_logs(self):
         try:
             core.LOGS.mkdir(parents=True, exist_ok=True)  # none before the first game
@@ -1516,7 +1556,7 @@ class SettingsPage(Adw.Bin):
 
         self._in_thread(lambda: core.update_launcher(progress), done)
 
-    def check_updates(self, install=False, on_progress=None, on_complete=None):
+    def check_updates(self, install=False, on_progress=None, on_complete=None, force_download=False):
         """Looks for a newer client; with install=True also installs it
         using the same asynchronous workflow as first-launch setup."""
         if self._checking_updates:
@@ -1533,14 +1573,14 @@ class SettingsPage(Adw.Bin):
             if error:
                 self.update_button.set_label(_("Check for updates"))
                 if install:
-                    self.window.end()
+                    self.window.end(resume_pending=False)
                 if on_complete:
                     on_complete(error)
                 else:
                     _toast(self.window.toasts, _("Could not check: {error}", error=error))
                 return
             version, upload = result
-            if version == core.installed_version():
+            if version == core.installed_version() and not force_download:
                 self.update_button.set_label(_("Check for updates"))
                 if install:
                     # A previous attempt may have downloaded Roblox but failed
@@ -1581,7 +1621,7 @@ class SettingsPage(Adw.Bin):
             GLib.idle_add(show_progress)
 
         def done(backup, error):
-            self.window.end()
+            self.window.end(resume_pending=error is None)
             self.update_button.set_sensitive(True)
             self._set_update_action(_("Check for updates"), self.check_updates)
             self.progress.set_visible(False)
@@ -2326,13 +2366,13 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.play_page.refresh()
         return True
 
-    def end(self):
+    def end(self, resume_pending=True):
         self.busy = None
         if self.quit_when_idle:
             self.get_application().quit()
             return
         self.play_page.refresh()
-        if self.pending_uri and core.installed_version() and not self.setup_active:
+        if resume_pending and self.pending_uri and core.installed_version() and not self.setup_active:
             pending = self.pending_uri
             GLib.idle_add(self.handle_uri, pending)
 
@@ -2375,7 +2415,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         # so the newest handoff is the one that starts the client.
         browser_uri = uri_handoff.peek_pending() or browser_uri
         self.pending_uri = browser_uri
-        if self.session or self.busy or self.setup_active:
+        if (self.session or self.busy or self.setup_active or
+                getattr(self, "_update_required_dialog_active", False)):
             # The pending file remains in place.  A later activation or the
             # end of the current operation will retry this exact argument.
             return
@@ -2692,6 +2733,15 @@ class LauncherWindow(Adw.ApplicationWindow):
         self._stop_rpc()
         core.save_settings(self.settings)
         self.play_page.refresh()
+        # Roblox's macOS updater cannot reliably replace the host bundle through
+        # Darling. It exits with success/a quit sentinel, so this is independent
+        # of the frontend exit code and must precede pending-URI auto-retries.
+        if core.exit_reason(self.last_log) == "update_required":
+            self.pending_uri = self.pending_uri or uri_handoff.peek_pending() or session.launch_uri
+            self.set_visible(True)
+            self.present()
+            self._roblox_update_required_dialog()
+            return False
         pending = self.pending_uri or uri_handoff.peek_pending()
         if pending:
             self.pending_uri = pending
@@ -2712,6 +2762,27 @@ class LauncherWindow(Adw.ApplicationWindow):
             else:
                 _toast(self.toasts, _("Roblox exited with code {status}", status=status))
         return False
+
+    def _roblox_update_required_dialog(self):
+        self._update_required_dialog_active = True
+        dialog = Adw.AlertDialog(
+            heading=_("Roblox needs an update"),
+            body=_("Roblox closed to install a required update. Let Mac O’ Blox download the current client, then try launching again."))
+        dialog.add_response("later", _("Later"))
+        dialog.add_response("update", _("Update Roblox"))
+        dialog.set_response_appearance("update", Adw.ResponseAppearance.SUGGESTED)
+
+        def response(_dialog, result):
+            self._update_required_dialog_active = False
+            if result == "update":
+                self.stack.set_visible_child_name("settings")
+                self.settings_page.set_tab("roblox")
+                # A deployment can replace the upload while keeping the same
+                # display version. A forced client quit warrants a fresh bundle.
+                self.settings_page.check_updates(install=True, force_download=True)
+
+        dialog.connect("response", response)
+        dialog.present(self)
 
     def _x11_broken_dialog(self):
         has_raw = self.settings.get("raw_mouse", True)

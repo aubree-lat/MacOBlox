@@ -22,6 +22,8 @@ its Windows version through Wine. English and Russian.
 
 ## Install
 
+Version **0.20** is a source release. Use the installer below to install or update.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
 ```
@@ -174,6 +176,21 @@ For the Flatpak, install the matching MangoHud extension with
 </details>
 
 <details>
+<summary>Select a laptop's dedicated GPU</summary>
+
+If multiple graphics cards are detected, choose one under
+**Settings → Environment → Game → Graphics card**, then restart Roblox.
+The choice applies to OpenGL and Vulkan (Zink). **Automatic** uses your desktop
+or terminal's GPU selection. The selected card needs a working graphics driver
+and must be accessible to the launcher, including inside Flatpak.
+
+Choosing between several proprietary NVIDIA cards with OpenGL requires an
+X11 provider selection. Use **Automatic** with
+`__NV_PRIME_RENDER_OFFLOAD_PROVIDER`, or choose Vulkan (Zink). A laptop with
+one NVIDIA card and an integrated GPU can use the menu with either renderer.
+</details>
+
+<details>
 <summary>Roblox UI is too small on a high DPI monitor</summary>
 
 Set **Settings → Environment → Game → Roblox UI scale** to **200%** for a
@@ -212,6 +229,9 @@ use `~/.var/app/wtf.aubree.MacOBlox/data/macoblox/logs/`. Also collect
 
 The lifecycle record describes the observed state before cleanup. A final
 `Broken pipe` can follow cleanup and does not identify the original failure.
+
+If the log says `app_closed_for_update`, Roblox intentionally closed for a
+required client update. Use **Update Roblox** in the launcher's recovery dialog.
 </details>
 
 <details>
@@ -251,8 +271,9 @@ how to open the `roblox-studio-auth` link, choose **Roblox Studio (Mac O’ Blox
 
 The Flatpak brings Darling along and runs it without root (see
 [flatpak/darling-noroot.c](flatpak/darling-noroot.c)), so nothing has to be
-installed on the system. Download `MacOBlox-*.flatpak` from the
-[latest release](https://github.com/aubree-lat/MacOBlox/releases/latest), then:
+installed on the system. Version 0.20 does not include a Flatpak bundle.
+The last testing bundle is available in
+[release 0.19](https://github.com/aubree-lat/MacOBlox/releases/tag/v0.19):
 
 ```bash
 flatpak install --user MacOBlox-0.19-x86_64.flatpak

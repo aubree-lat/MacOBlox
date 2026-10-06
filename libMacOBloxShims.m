@@ -6512,11 +6512,13 @@ const void* kTISNotifySelectedKeyboardInputSourceChanged = @"kTISNotifySelectedK
 const void* kTISPropertyInputSourceLanguages = @"kTISPropertyInputSourceLanguages";
 const void* kTISPropertyUnicodeKeyLayoutData = @"kTISPropertyUnicodeKeyLayoutData";
 
+#include "keyboard_labels.h"
+
 // The original Carbon compatibility framework returned NULL for the current
 // keyboard source and all of its properties. Roblox copies the Unicode layout
 // data during startup, so that placeholder becomes CFDataCreateCopy(NULL) and
 // crashes in CFDataGetLength. Keep real Objective-C objects alive for the
-// process and interpose the three Text Input Source entry points.
+// process and provide a valid ANSI fallback resource for key-label queries.
 static id macoblox_keyboard_source;
 static id macoblox_keyboard_layout_data;
 static id macoblox_keyboard_languages;
@@ -6534,11 +6536,13 @@ static void macoblox_initialize_keyboard_source(void) {
         return;
     }
     Class object_class = objc_getClass("NSObject");
-    Class data_class = objc_getClass("NSMutableData");
+    Class data_class = objc_getClass("NSData");
     Class array_class = objc_getClass("NSArray");
     if (object_class && data_class && array_class) {
-        id data = ((id (*)(id, SEL, unsigned long))objc_msgSend)(
-            (id)data_class, sel_registerName("dataWithLength:"), 4096UL);
+        MacOBloxKeyboardLabels layout;
+        macoblox_build_keyboard_labels(&layout);
+        id data = ((id (*)(id, SEL, const void*, unsigned long))objc_msgSend)(
+            (id)data_class, sel_registerName("dataWithBytes:length:"), &layout, sizeof layout);
         macoblox_keyboard_layout_data = data
             ? ((id (*)(id, SEL))objc_msgSend)(data, sel_registerName("retain")) : 0;
         id languages = ((id (*)(id, SEL, id))objc_msgSend)(
@@ -6548,6 +6552,8 @@ static void macoblox_initialize_keyboard_source(void) {
         id source = ((id (*)(id, SEL))objc_msgSend)((id)object_class, sel_registerName("new"));
         __sync_synchronize();
         macoblox_keyboard_source = source;
+        if (source && macoblox_keyboard_layout_data)
+            write_str("[MacOBlox] Carbon key labels use a valid ANSI fallback layout\n");
     }
     __sync_synchronize();
     state = 2;
@@ -6573,8 +6579,8 @@ const void* TISGetInputSourceProperty(void* source, const void* key) {
     return 0;
 }
 
-// The zero-filled CFData above is only a non-null compatibility token. Avoid
-// parsing it as a UCKeyboardLayout until Darling provides a real Carbon layout.
+// Roblox uses this API for UI key names, separately from AppKit text input.
+// Never report successful empty translation for a printable key such as E.
 int UCKeyTranslate(const void* layout, unsigned short key_code,
                    unsigned short key_action, unsigned int modifiers,
                    unsigned int keyboard_type, unsigned int options,
@@ -6582,13 +6588,20 @@ int UCKeyTranslate(const void* layout, unsigned short key_code,
                    unsigned long max_length,
                    unsigned long* actual_length,
                    unsigned short* unicode_string) {
-    (void)layout; (void)key_code; (void)key_action; (void)modifiers;
-    (void)keyboard_type; (void)options; (void)max_length; (void)unicode_string;
-    if (dead_key_state)
-        *dead_key_state = 0;
-    if (actual_length)
-        *actual_length = 0;
-    return 0;
+    if (macoblox_is_keyboard_labels(layout))
+        return macoblox_translate_keyboard_label(layout, key_code, key_action, modifiers,
+            dead_key_state, max_length, actual_length, unicode_string);
+    int (*real_translate)(const void*, unsigned short, unsigned short, unsigned int,
+        unsigned int, unsigned int, unsigned int*, unsigned long, unsigned long*, unsigned short*) =
+        MACOBLOX_NEXT(int (*)(const void*, unsigned short, unsigned short, unsigned int,
+            unsigned int, unsigned int, unsigned int*, unsigned long, unsigned long*, unsigned short*),
+            "UCKeyTranslate");
+    if (real_translate && real_translate != UCKeyTranslate && layout && actual_length &&
+        dead_key_state && unicode_string && key_code < 128 && key_action <= 3 && max_length)
+        return real_translate(layout, key_code, key_action, modifiers, keyboard_type, options,
+            dead_key_state, max_length, actual_length, unicode_string);
+    if (actual_length) *actual_length = 0;
+    return -50;
 }
 
 // CoreServices constants

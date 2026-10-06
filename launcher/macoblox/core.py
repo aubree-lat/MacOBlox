@@ -1,6 +1,7 @@
 """Backend of the Mac O’ Blox launcher: paths, settings, fast flags, Roblox
 updates and running the macOS client through Darling. No GTK here."""
 
+import csv
 import hashlib
 import json
 import logging
@@ -22,6 +23,7 @@ import zipfile
 from pathlib import Path
 
 from . import __version__
+from .gpus import GPU_ENVIRONMENT
 from .i18n import _
 from .rootless_scope import rootless_process_in_prefix
 
@@ -88,6 +90,7 @@ DEFAULT_SETTINGS = {
     "display_backend": "x11",
     "dpi_scale": 1.0,
     "renderer": "opengl",
+    "gpu": "auto",
     "mangohud": False,
     "hide_menu_bar": False,
     "dns": "system",
@@ -1057,6 +1060,9 @@ def exit_reason(log_path):
             tail = file.read().decode(errors="replace")
     except (OSError, TypeError):
         return None
+    if ("flow end: app_closed_for_update" in tail or
+            "Found new version and the updater launched. Drain reporting and quit." in tail):
+        return "update_required"
     if "class WKWebView" in tail or "Selector setDetachesHiddenViews:" in tail:
         return "captcha"
     if "X connection to " in tail and "broken (explicit kill or server shutdown)" in tail:
@@ -1423,7 +1429,10 @@ def icon_argb_file():
     return target
 
 
-LAUNCH_SCRIPT = r'''
+# shellspawn can inherit the environment of an already-running Darling server.
+# Clear GPU selectors before restoring this session's host selections so an
+# Automatic launch cannot retain the previous game's offload/ICD overrides.
+LAUNCH_SCRIPT = "unset " + " ".join(GPU_ENVIRONMENT) + "\n" + r'''
 project=$1 shim_dir=$2 launch_uri=$3; shift 3
 for kv in "$@"; do export "$kv"; done
 # Roblox's own frame rate limit (FramerateCap, its Maximum Frame Rate
@@ -1470,7 +1479,7 @@ exec ./RobloxPlayer
 '''
 
 
-def host_vram_bytes(renderer=None):
+def host_vram_bytes(renderer=None, adapter=None):
     """Conservative graphics budget for the selected GPU, never the largest.
 
     Reserve memory for the compositor/driver and account for current use. If
@@ -1493,22 +1502,39 @@ def host_vram_bytes(renderer=None):
             used = int(used_file.read_text().strip()) if used_file.is_file() else total // 4
             value = budget(total, total - used)
             if value is not None:
-                candidates.append(("", value))
+                candidates.append((path.parent.resolve().name, "", value))
         except (OSError, ValueError):
             pass
     try:
+        fields = "name,memory.total,memory.free"
+        if adapter:
+            fields = "pci.bus_id," + fields
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=" + fields, "--format=csv,noheader,nounits"],
             stderr=subprocess.DEVNULL, text=True, timeout=1)
-        for line in out.strip().splitlines():
-            name, total, free = (part.strip() for part in line.split(","))
-            value = budget(int(total) * 1024 * 1024, int(free) * 1024 * 1024)
-            if value is not None:
-                candidates.append((name, value))
-    except (OSError, ValueError, subprocess.SubprocessError):
+        from .gpus import pci_address
+        for row in csv.reader(out.splitlines()):
+            try:
+                address = None
+                parts = [part.strip() for part in row]
+                if adapter:
+                    address, name, total, free = parts
+                    address = pci_address(address)
+                else:
+                    name, total, free = parts
+                value = budget(int(total) * 1024 * 1024, int(free) * 1024 * 1024)
+                if value is not None:
+                    candidates.append((address, name, value))
+            except ValueError:
+                continue
+    except (OSError, csv.Error, subprocess.SubprocessError):
         pass
-    selected = [value for name, value in candidates if name and renderer and name.lower() in renderer.lower()]
-    values = selected or [value for _name, value in candidates]
+    if adapter:
+        values = [value for address, _name, value in candidates if address == adapter["pci"]]
+    else:
+        selected = [value for _address, name, value in candidates
+                    if name and renderer and name.lower() in renderer.lower()]
+        values = selected or [value for _address, _name, value in candidates]
     return min(values) if values else 512 * 1024 * 1024
 
 
@@ -1722,17 +1748,33 @@ class RobloxSession:
         # its socket as the guest sees it, and WebKit's user agent.
         self.web_socket = None
         self.web_user_agent = None
+        self.gpu_adapter = None
+        self._gpu_environment = None
         # A sentinel left over from a quit that outlived the launcher must not
         # end this session before it starts.
         QUIT_SENTINEL.unlink(missing_ok=True)
 
+    def _graphics_environment(self):
+        from . import graphics, display, gpus
+        renderer = self.settings.get("renderer", "opengl")
+        if self._gpu_environment is None:
+            self.gpu_adapter = gpus.selected_gpu(self.settings.get("gpu", "auto"))
+            self._gpu_environment = gpus.gpu_environment(self.gpu_adapter, renderer)
+        return {
+            **graphics.renderer_environment(renderer),
+            **self._gpu_environment,
+            **graphics.mangohud_environment(renderer, self.settings.get("mangohud", False)),
+            **display.window_environment(self.settings, SHIM_DIR / "libmacoblox-wayland.so"),
+            **gpus.host_graphics_paths(),
+        }
+
     def environment(self):
-        from . import graphics, display
         env = darling_environment()
-        env.update(graphics.renderer_environment(self.settings.get("renderer", "opengl")))
-        env.update(graphics.mangohud_environment(self.settings.get("renderer", "opengl"),
-                                               self.settings.get("mangohud", False)))
-        env.update(display.window_environment(self.settings, SHIM_DIR / "libmacoblox-wayland.so"))
+        # Rebuild the allowlisted selectors, including intentional removals
+        # (a PCI choice must not compete with an inherited vendor-ID choice).
+        for name in GPU_ENVIRONMENT:
+            env.pop(name, None)
+        env.update(self._graphics_environment())
         if env["MACOBLOX_WAYLAND"] == "1":
             env.pop("DISPLAY", None)
         return env
@@ -1758,18 +1800,12 @@ class RobloxSession:
             # place tiles). A host directory makes those caches persistent.
             f"TMPDIR=/Volumes/SystemRoot{CACHE_DIR / 'roblox-tmp'}",
         ]
-        from . import graphics
-        variables.extend(f"{name}={value}" for name, value in
-                         graphics.renderer_environment(self.settings.get("renderer", "opengl")).items())
         from . import display
         variables.append(f"MACOBLOX_DPI_SCALE={display.validated_dpi_scale(self.settings.get('dpi_scale', 1.0)):.3f}")
-        variables.extend(f"{name}={value}" for name, value in
-                         display.window_environment(self.settings, SHIM_DIR / "libmacoblox-wayland.so").items())
         # Host graphics libraries see the guest environment after exec.
         variables.extend(f"{name}={value}" for name, value in
-                         graphics.mangohud_environment(self.settings.get("renderer", "opengl"),
-                                                       self.settings.get("mangohud", False)).items())
-        vram = host_vram_bytes(getattr(self, "renderer_name", None))
+                         self._graphics_environment().items())
+        vram = host_vram_bytes(getattr(self, "renderer_name", None), self.gpu_adapter)
         if vram:
             variables.append(f"MACOBLOX_VRAM_BYTES={vram}")
         if self.settings.get("hide_menu_bar"):
@@ -1884,6 +1920,11 @@ class RobloxSession:
             log.write(f"Mac O’ Blox {__version__}\n".encode())
             log.write(f"Darling: {darling_version(env)}\n".encode())
             log.write(f"Renderer requested: {renderer_name}\n".encode())
+            if self.gpu_adapter:
+                name = self.gpu_adapter["name"].replace("\n", " ").replace("\r", " ")[:200]
+                log.write(f"Graphics card requested: {name}; PCI {self.gpu_adapter['pci']}\n".encode())
+            else:
+                log.write(b"Graphics card requested: Automatic (desktop/terminal selection)\n")
             packaging = "Flatpak" if os.environ.get("FLATPAK_ID") else (
                 "prebuilt" if PREBUILT_SHIM else "source")
             version = re.sub(r"[^A-Za-z0-9._+-]", "?", (installed_version() or "unknown")[:80])
