@@ -216,7 +216,7 @@ install_arch() {
 install_debian() {
   say "Installing tools (apt)"
   sudo apt-get update
-  sudo apt-get install -y git curl unzip clang lld pipewire-bin python3 python3-gi \
+  sudo apt-get install -y git curl unzip clang lld pipewire-bin pulseaudio-utils python3 python3-gi \
     gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0 libsdl2-dev libwayland-dev pkg-config
 }
 
@@ -379,13 +379,29 @@ build_darling_source() {
   log=$build/build.log
   say "Building Darling; sources and log: $build"
   
-  # Clone with live output
-  GIT_CLONE_PROTECTION_ACTIVE=false git clone --recursive --branch "$DARLING_TAG" \
+  # Swift runtime binaries live on a separate upstream LFS service, which can
+  # request credentials or be unavailable even though Darling's source is
+  # public. Roblox uses the C/C++/Objective-C runtime; this source installation
+  # excludes the optional Swift SDK rather than installing LFS pointer files
+  # as if they were libraries. Public clones never ask for a GitHub login.
+  GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false \
+    GIT_LFS_SKIP_SMUDGE=1 GIT_CLONE_PROTECTION_ACTIVE=false \
+    git -c credential.helper= -c core.askPass=/bin/false clone --recursive --branch "$DARLING_TAG" \
     https://github.com/darlinghq/darling.git "$build/source" 2>&1 | tee "$log" ||
-    die "Darling source download failed. Log: $log"
+    die "Public Darling source download failed. No GitHub login is needed. Check the failed repository URL in: $log"
   
-  git -C "$build/source" lfs install --local 2>&1 | tee -a "$log" || die "Git LFS initialization failed. Log: $log"
-  git -C "$build/source" lfs pull 2>&1 | tee -a "$log" || die "Git LFS download failed. Log: $log"
+  git -C "$build/source" lfs install --local --skip-smudge 2>&1 | tee -a "$log" ||
+    die "Git LFS initialization failed. Log: $log"
+  local swift_library first_line
+  for swift_library in "$build/source/src/external/swift"/*.dylib; do
+    [[ -f $swift_library ]] || continue
+    first_line=''
+    IFS= read -r -n 80 first_line < "$swift_library" || true
+    if [[ $first_line == 'version https://git-lfs.github.com/spec/v1' ]]; then
+      rm -- "$swift_library"
+    fi
+  done
+  say "Optional Swift SDK LFS downloads skipped; Roblox's runtime is built from source."
   
   # Configure with live output
   say "Configuring Darling (this may take a few minutes)..."

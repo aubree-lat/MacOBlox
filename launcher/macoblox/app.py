@@ -1379,6 +1379,10 @@ class SettingsPage(Adw.Bin):
         self._update_handler = self.update_button.connect("clicked", lambda *_args: self.check_updates())
         self.version_row.add_suffix(self.update_button)
         roblox.add(self.version_row)
+        self.channel_row = Adw.ActionRow(
+            title=_("Update channel"),
+            subtitle=settings.get("roblox_channel") or _("Production (default)"))
+        roblox.add(self.channel_row)
 
         self.auto_update_switch = Adw.SwitchRow(
             title=_("Check for Roblox updates on startup"),
@@ -1566,6 +1570,10 @@ class SettingsPage(Adw.Bin):
         self._checking_updates = True
         self.update_button.set_sensitive(False)
         self.update_button.set_label(_("Checking…"))
+        channel = self.window.settings.get("roblox_channel", "")
+        target = core.required_client_update(self.window.last_log)
+        if target and "channel" in target:
+            channel = target["channel"]
 
         def done(result, error):
             self._checking_updates = False
@@ -1580,7 +1588,8 @@ class SettingsPage(Adw.Bin):
                     _toast(self.window.toasts, _("Could not check: {error}", error=error))
                 return
             version, upload = result
-            if version == core.installed_version() and not force_download:
+            installed = core.installed_version()
+            if installed and not core.version_is_newer(version, installed) and not force_download:
                 self.update_button.set_label(_("Check for updates"))
                 if install:
                     # A previous attempt may have downloaded Roblox but failed
@@ -1589,19 +1598,19 @@ class SettingsPage(Adw.Bin):
                     self.install_update(upload, on_progress=on_progress, on_complete=on_complete,
                                         _claimed=True, _prepare_only=True)
                 else:
-                    _toast(self.window.toasts, _("The latest version is installed"))
+                    _toast(self.window.toasts, _("No newer version was reported for this channel"))
                 return
             self._set_update_action(_("Update to {version}", version=version),
-                                    lambda: self.install_update(upload))
+                                    lambda: self.install_update(upload, expected_version=version, channel=channel))
             if install:
                 self.install_update(upload, on_progress=on_progress, on_complete=on_complete,
-                                    _claimed=True)
+                                    _claimed=True, expected_version=version, channel=channel)
 
-        self._in_thread(core.latest_version, done)
+        self._in_thread(lambda: core.latest_version(channel, required_log=self.window.last_log), done)
         return True
 
     def install_update(self, upload, on_progress=None, on_complete=None,
-                       _claimed=False, _prepare_only=False):
+                       _claimed=False, _prepare_only=False, expected_version=None, channel=None):
         if not _claimed and not self.window.begin("updating"):
             return False
         self.update_button.set_sensitive(False)
@@ -1621,6 +1630,9 @@ class SettingsPage(Adw.Bin):
             GLib.idle_add(show_progress)
 
         def done(backup, error):
+            if error is None and not _prepare_only and channel is not None:
+                self.window.set_setting("roblox_channel", channel)
+                self.channel_row.set_subtitle(channel or _("Production (default)"))
             self.window.end(resume_pending=error is None)
             self.update_button.set_sensitive(True)
             self._set_update_action(_("Check for updates"), self.check_updates)
@@ -1643,7 +1655,8 @@ class SettingsPage(Adw.Bin):
         def work():
             backup = None
             if not _prepare_only:
-                backup = core.update_roblox(upload, lambda fraction, text: progress(fraction * 0.93, text))
+                backup = core.update_roblox(upload, lambda fraction, text: progress(fraction * 0.93, text),
+                                            expected_version=expected_version)
             progress(0.94, _("Rebuilding the shim…"))
             ok, output = core.build_shim()
             if not ok:
@@ -2313,9 +2326,13 @@ class LauncherWindow(Adw.ApplicationWindow):
             try:
                 installed = core.installed_version()
                 if installed:
-                    latest, upload = core.latest_version()
-                    if latest != installed:
-                        GLib.idle_add(self._show_roblox_update_dialog, latest, upload)
+                    channel = self.settings.get("roblox_channel", "")
+                    target = core.required_client_update(self.last_log)
+                    if target and "channel" in target:
+                        channel = target["channel"]
+                    latest, upload = core.latest_version(channel, required_log=self.last_log)
+                    if core.version_is_newer(latest, installed):
+                        GLib.idle_add(self._show_roblox_update_dialog, latest, upload, channel)
             except Exception:
                 pass
 
@@ -2337,7 +2354,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         dialog.connect("response", response)
         dialog.present(self)
 
-    def _show_roblox_update_dialog(self, latest, upload):
+    def _show_roblox_update_dialog(self, latest, upload, channel=None):
         dialog = Adw.AlertDialog(
             heading=_("Roblox update available"),
             body=_("A newer version of Roblox ({version}) is available. Update now?", version=latest),
@@ -2350,7 +2367,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             if result == "update":
                 self.stack.set_visible_child_name("settings")
                 self.settings_page.set_tab("roblox")
-                self.settings_page.install_update(upload)
+                self.settings_page.install_update(upload, expected_version=latest, channel=channel)
 
         dialog.connect("response", response)
         dialog.present(self)
@@ -2737,10 +2754,14 @@ class LauncherWindow(Adw.ApplicationWindow):
         # Darling. It exits with success/a quit sentinel, so this is independent
         # of the frontend exit code and must precede pending-URI auto-retries.
         if core.exit_reason(self.last_log) == "update_required":
+            target = core.required_client_update(self.last_log)
+            if target and "channel" in target:
+                self.set_setting("roblox_channel", target["channel"])
+                self.settings_page.channel_row.set_subtitle(target["channel"] or _("Production (default)"))
             self.pending_uri = self.pending_uri or uri_handoff.peek_pending() or session.launch_uri
             self.set_visible(True)
             self.present()
-            self._roblox_update_required_dialog()
+            self._roblox_update_required_dialog(target)
             return False
         pending = self.pending_uri or uri_handoff.peek_pending()
         if pending:
@@ -2763,11 +2784,19 @@ class LauncherWindow(Adw.ApplicationWindow):
                 _toast(self.toasts, _("Roblox exited with code {status}", status=status))
         return False
 
-    def _roblox_update_required_dialog(self):
+    def _roblox_update_required_dialog(self, target=None):
         self._update_required_dialog_active = True
+        body = _("Roblox closed to install a required update. Let Mac O’ Blox download the current client, then try launching again.")
+        if target and target.get("upload"):
+            if "channel" in target:
+                body = _("Roblox requires version {version} on channel {channel}. Mac O’ Blox will download that exact client, then try launching again.",
+                         version=target["version"], channel=target["channel"] or _("Production"))
+            else:
+                body = _("Roblox requires version {version}. Mac O’ Blox will download that exact client, then try launching again.",
+                         version=target["version"])
         dialog = Adw.AlertDialog(
             heading=_("Roblox needs an update"),
-            body=_("Roblox closed to install a required update. Let Mac O’ Blox download the current client, then try launching again."))
+            body=body)
         dialog.add_response("later", _("Later"))
         dialog.add_response("update", _("Update Roblox"))
         dialog.set_response_appearance("update", Adw.ResponseAppearance.SUGGESTED)
@@ -2777,9 +2806,13 @@ class LauncherWindow(Adw.ApplicationWindow):
             if result == "update":
                 self.stack.set_visible_child_name("settings")
                 self.settings_page.set_tab("roblox")
-                # A deployment can replace the upload while keeping the same
-                # display version. A forced client quit warrants a fresh bundle.
-                self.settings_page.check_updates(install=True, force_download=True)
+                # Gated channels can return 401 to the launcher's anonymous
+                # check. The signed-in client already reported its deployment.
+                if target and target.get("upload"):
+                    self.settings_page.install_update(target["upload"], expected_version=target["version"],
+                                                      channel=target.get("channel"))
+                else:
+                    self.settings_page.check_updates(install=True, force_download=True)
 
         dialog.connect("response", response)
         dialog.present(self)

@@ -1,5 +1,37 @@
 # Release notes
 
+## 0.21 — 2026-10-06
+
+- Fix required-update loops when Roblox requests a different deployment
+  channel from the launcher's default. Recover the validated version and
+  upload ID from the client's update response, download that official upload,
+  and verify the bundle version before replacing the installed client.
+  Remember and show the client's update channel, handle gated channel checks
+  without sending copied credentials, and avoid offering older deployments.
+- Detect whether `pw-cat` supports raw audio. Use `pacat` through PipeWire's
+  PulseAudio server on older versions, including PipeWire 1.0.5. Install the
+  fallback on Debian/Ubuntu/Mint, retain playback errors in session logs and
+  fall back after native playback failures.
+- Apply intentional locked-cursor position changes to the visible overlay and
+  frozen event coordinates on the event thread. Keep native confinement and
+  unlock restoration, coalesce repeated requests, and suppress background
+  cursor warps after focus loss. Shift-lock visibility still needs gameplay
+  confirmation on the reporting system.
+- Prevent public Darling source downloads from prompting for Git credentials.
+  Skip the separate optional Swift SDK LFS downloads and exclude their pointer
+  placeholders from source installs. The current Roblox client does not link
+  that runtime; source-built Darling does not gain Swift SDK support.
+
+### Packaging and verification
+
+This is a source release. No Flatpak bundle is included in 0.21.
+
+The native shim and framework stubs build successfully; changed Python sources
+parse successfully and the installer passes shell syntax checks. The official
+0.742 deployment requested in the report has the expected bundle version and
+no linked Swift libraries. Mint playback, shift-lock icon visibility and a full
+Darling source installation have not been verified on the reporting system.
+
 ## 0.20 — 2026-10-05
 
 ### Input fixes

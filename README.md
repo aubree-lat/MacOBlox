@@ -22,7 +22,7 @@ its Windows version through Wine. English and Russian.
 
 ## Install
 
-Version **0.20** is a source release. Use the installer below to install or update.
+Version **0.21** is a source release. Use the installer below to install or update.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
@@ -70,7 +70,7 @@ Debian, Ubuntu, Mint: download `debs_20260608.zip` from the
 ```bash
 unzip debs_*.zip -d darling-debs
 sudo apt install ./darling-debs/*/*.deb
-sudo apt install clang lld unzip pipewire-bin python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0
+sudo apt install clang lld unzip pipewire-bin pulseaudio-utils python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0
 ```
 
 Fedora and others: build Darling with the
@@ -232,6 +232,33 @@ The lifecycle record describes the observed state before cleanup. A final
 
 If the log says `app_closed_for_update`, Roblox intentionally closed for a
 required client update. Use **Update Roblox** in the launcher's recovery dialog.
+The launcher follows the client's reported update channel and installs the
+exact deployment it requests. **Settings → Roblox → Update channel** shows the
+last reported channel. A restricted channel such as `zbeta` can reject anonymous
+update checks; the client's own required-update response supplies the download
+instead. Changing a launcher configuration value does not change Roblox's
+account enrollment.
+</details>
+
+<details>
+<summary>No sound with older PipeWire</summary>
+
+PipeWire 1.0.5's `pw-cat` cannot play the launcher's raw audio stream.
+Mac O’ Blox uses `pacat` through PipeWire's PulseAudio compatibility server on
+these versions. On Mint/Ubuntu/Debian, install it with
+`sudo apt install pulseaudio-utils`, then restart Roblox. The source installer
+includes this package. The launch log records the playback helper and its
+errors.
+</details>
+
+<details>
+<summary>Git LFS credentials during a Darling source build</summary>
+
+Public source downloads do not need a GitHub login. The installer skips
+Darling's optional Swift SDK files from its separate LFS service; the current
+Roblox client does not link that runtime. Source-built Darling therefore does
+not include Swift SDK support. Build dependencies and installing Darling into
+`/usr/local` still use sudo.
 </details>
 
 <details>
@@ -271,7 +298,7 @@ how to open the `roblox-studio-auth` link, choose **Roblox Studio (Mac O’ Blox
 
 The Flatpak brings Darling along and runs it without root (see
 [flatpak/darling-noroot.c](flatpak/darling-noroot.c)), so nothing has to be
-installed on the system. Version 0.20 does not include a Flatpak bundle.
+installed on the system. Version 0.21 does not include a Flatpak bundle.
 The last testing bundle is available in
 [release 0.19](https://github.com/aubree-lat/MacOBlox/releases/tag/v0.19):
 

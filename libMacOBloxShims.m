@@ -2751,6 +2751,10 @@ static int macoblox_capture_request_ready = 1, macoblox_capture_request_has_snap
 static unsigned int macoblox_capture_request_root;
 static int macoblox_capture_request_x, macoblox_capture_request_y;
 static int macoblox_capture_request_no_restore, macoblox_recenter_requested;
+static MacOBloxPoint macoblox_locked_cursor_position;
+static int macoblox_locked_cursor_position_valid, macoblox_locked_cursor_position_pending;
+static unsigned long macoblox_capture_root;
+static unsigned int macoblox_capture_root_height;
 extern int pthread_main_np(void);
 extern int macoblox_raw_x_pointer_snapshot(unsigned int*, int*, int*);
 static void macoblox_wake_event_queue(void);
@@ -3371,6 +3375,8 @@ static void macoblox_release_mouse_capture_inner(int restore) {
     __atomic_store_n(&macoblox_raw_mouse_active, 0, __ATOMIC_RELEASE);
     macoblox_drop_warp_motion = macoblox_drop_next_motion = 0;
     macoblox_recenter_requested = 0;
+    macoblox_locked_cursor_position_valid = macoblox_locked_cursor_position_pending = 0;
+    macoblox_capture_root = macoblox_capture_root_height = 0;
     macoblox_unlock(&macoblox_capture_request_lock);
     macoblox_raw_mouse_selected = -1; // a rapid relock must reapply XI2 selection
     macoblox_raw_have_anchor = 0;
@@ -3490,14 +3496,17 @@ static int macoblox_apply_mouse_capture_inner(int grab, int has_snapshot,
     unsigned long root_parent;
     int root_geometry_x, root_geometry_y;
     unsigned int root_width, root_height, root_border, root_depth;
-    if (root_positioned && get_geometry(display, root, &root_parent, &root_geometry_x, &root_geometry_y,
-                                        &root_width, &root_height, &root_border, &root_depth)) {
+    int screen_positioned = root_positioned && get_geometry(display, root, &root_parent,
+        &root_geometry_x, &root_geometry_y, &root_width, &root_height, &root_border, &root_depth);
+    if (screen_positioned) {
         frozen_screen.x = root_x;
         frozen_screen.y = (double)root_height - root_y;
     }
     macoblox_lock(&macoblox_capture_request_lock);
     macoblox_frozen_window_location = frozen_window;
     macoblox_frozen_screen_location = frozen_screen;
+    macoblox_capture_root = screen_positioned ? root : 0;
+    macoblox_capture_root_height = screen_positioned ? root_height : 0;
     macoblox_lock_anchor = lock_anchor;
     macoblox_lock_anchor_pending = x != macoblox_capture_anchor_x || y != macoblox_capture_anchor_y;
     macoblox_drop_warp_motion = macoblox_drop_next_motion = 0;
@@ -3520,6 +3529,40 @@ static int macoblox_apply_mouse_capture(int grab) {
     return macoblox_apply_mouse_capture_inner(grab, 0, 0, 0, 0);
 }
 
+static void macoblox_apply_locked_cursor_position(void) {
+    macoblox_lock(&macoblox_capture_request_lock);
+    int pending = macoblox_locked_cursor_position_pending;
+    MacOBloxPoint position = macoblox_locked_cursor_position;
+    unsigned long root = macoblox_capture_root;
+    unsigned int root_height = macoblox_capture_root_height;
+    if (macoblox_pointer_grabbed) macoblox_locked_cursor_position_pending = 0;
+    macoblox_unlock(&macoblox_capture_request_lock);
+    if (!pending || !root || !macoblox_pointer_grabbed) return;
+    static int (*translate)(void*, unsigned long, unsigned long, int, int, int*, int*, unsigned long*);
+    if (!translate)
+        translate = (int (*)(void*, unsigned long, unsigned long, int, int, int*, int*, unsigned long*))
+            dlsym(RTLD_DEFAULT, "XTranslateCoordinates");
+    int x, y;
+    unsigned long child;
+    if (!translate || !translate(macoblox_capture_display, root, macoblox_capture_window,
+                                 (int)position.x, (int)position.y, &x, &y, &child)) return;
+    id window = macoblox_lock_window();
+    if (macoblox_native_window_handle(window) != macoblox_capture_window) return;
+    id platform = ((id (*)(id, SEL))objc_msgSend)(window, sel_registerName("platformWindow"));
+    MacOBloxPoint native = {x, y};
+    MacOBloxPoint local = ((MacOBloxPoint (*)(id, SEL, MacOBloxPoint))objc_msgSend)(
+        platform, sel_registerName("transformPoint:"), native);
+    macoblox_lock(&macoblox_capture_request_lock);
+    macoblox_frozen_window_location = local;
+    macoblox_frozen_screen_location = (MacOBloxPoint){position.x, (double)root_height - position.y};
+    macoblox_unlock(&macoblox_capture_request_lock);
+    macoblox_lock(&macoblox_window_cursor_lock);
+    macoblox_cursor_lock_x = x;
+    macoblox_cursor_lock_y = y;
+    macoblox_unlock(&macoblox_window_cursor_lock);
+    macoblox_cursor_changed();
+}
+
 static void macoblox_process_mouse_capture_requests(void) {
     if (!pthread_main_np()) return;
     if (macoblox_pointer_grabbed && !__atomic_load_n(&macoblox_cursor_worker_ready, __ATOMIC_ACQUIRE))
@@ -3540,6 +3583,7 @@ static void macoblox_process_mouse_capture_requests(void) {
         if (!wanted && no_restore) macoblox_release_mouse_capture_inner(0);
         else macoblox_apply_mouse_capture_inner(wanted, has_snapshot, root, x, y);
     }
+    macoblox_apply_locked_cursor_position();
     if (recenter && macoblox_pointer_grabbed && !macoblox_raw_mouse_active &&
         macoblox_recenter_pointer_on_owner()) {
         macoblox_lock(&macoblox_capture_request_lock);
@@ -3560,6 +3604,7 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
         return 0;
     }
     __atomic_store_n(&macoblox_mouse_lock_requested, wanted, __ATOMIC_RELEASE);
+    macoblox_locked_cursor_position_valid = macoblox_locked_cursor_position_pending = 0;
     unsigned long generation = ++macoblox_capture_request_generation;
     macoblox_capture_request_ready = !wanted;
     macoblox_capture_request_has_snapshot = 0;
@@ -3592,9 +3637,28 @@ static int macoblox_CGWarpMouseCursorPosition(MacOBloxPoint position) {
     if (macoblox_wayland_enabled())
         return macoblox_wayland_warp(position);
     if (__atomic_load_n(&macoblox_pointer_grabbed, __ATOMIC_ACQUIRE) ||
-        (__atomic_load_n(&macoblox_mouse_lock_requested, __ATOMIC_ACQUIRE) &&
-         __atomic_load_n(&macoblox_input_focused, __ATOMIC_ACQUIRE)))
-        return 0; // Roblox warps every frame during the lock
+        __atomic_load_n(&macoblox_mouse_lock_requested, __ATOMIC_ACQUIRE)) {
+        /* Shift lock intentionally moves its visible cursor to the center.
+         * Move the logical cursor/overlay on the event owner without moving
+         * the confined native pointer or replacing its unlock restoration.
+         * Identical per-frame requests do not cause X queries or worker wakes.
+         * Background requests must not warp the desktop after focus loss. */
+        if (__atomic_load_n(&macoblox_input_focused, __ATOMIC_ACQUIRE) &&
+            __builtin_isfinite(position.x) && __builtin_isfinite(position.y) &&
+            position.x > -2147483000.0 && position.x < 2147483000.0 &&
+            position.y > -2147483000.0 && position.y < 2147483000.0) {
+            macoblox_lock(&macoblox_capture_request_lock);
+            int changed = !macoblox_locked_cursor_position_valid ||
+                position.x != macoblox_locked_cursor_position.x || position.y != macoblox_locked_cursor_position.y;
+            if (changed) {
+                macoblox_locked_cursor_position = position;
+                macoblox_locked_cursor_position_valid = macoblox_locked_cursor_position_pending = 1;
+            }
+            macoblox_unlock(&macoblox_capture_request_lock);
+            if (changed) macoblox_wake_event_queue();
+        }
+        return 0;
+    }
     return CGWarpMouseCursorPosition(position);
 }
 DYLD_INTERPOSE(macoblox_CGWarpMouseCursorPosition, CGWarpMouseCursorPosition);

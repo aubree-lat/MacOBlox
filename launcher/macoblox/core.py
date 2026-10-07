@@ -2,6 +2,7 @@
 updates and running the macOS client through Darling. No GTK here."""
 
 import csv
+import functools
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ import threading
 import sys
 import time
 import urllib.request
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -91,6 +93,7 @@ DEFAULT_SETTINGS = {
     "dpi_scale": 1.0,
     "renderer": "opengl",
     "gpu": "auto",
+    "roblox_channel": "",
     "mangohud": False,
     "hide_menu_bar": False,
     "dns": "system",
@@ -232,12 +235,42 @@ def installed_version():
     return version if isinstance(version, str) else None
 
 
-def latest_version():
+def _validated_deployment(data):
+    if not isinstance(data, dict):
+        raise ValueError("Invalid Roblox deployment response")
+    version, upload = data.get("version"), data.get("clientVersionUpload")
+    if (not isinstance(version, str) or not re.fullmatch(r"\d{1,10}(?:\.\d{1,10}){3}", version)
+            or not isinstance(upload, str) or not re.fullmatch(r"version-[0-9a-fA-F]{16,64}", upload)):
+        raise ValueError("Invalid Roblox deployment version or upload identifier")
+    return version, upload
+
+
+def version_is_newer(candidate, installed):
+    try:
+        return tuple(map(int, candidate.split("."))) > tuple(map(int, installed.split(".")))
+    except (AttributeError, TypeError, ValueError):
+        return candidate != installed
+
+
+def latest_version(channel=None, required_log=None):
     """Returns (version, clientVersionUpload) from Roblox's version service."""
-    request = urllib.request.Request(VERSION_URL, headers={"User-Agent": "MacOBlox"})
-    with urllib.request.urlopen(request, timeout=10) as response:
-        data = json.load(response)
-    return data["version"], data["clientVersionUpload"]
+    channel = load_settings().get("roblox_channel", "") if channel is None else channel
+    if not isinstance(channel, str) or (channel and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", channel)):
+        raise RuntimeError("Invalid Roblox update channel")
+    url = VERSION_URL + ("/channel/" + channel if channel else "")
+    request = urllib.request.Request(url, headers={"User-Agent": "MacOBlox"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read(65536))
+    except urllib.error.HTTPError as error:
+        if channel and error.code in (401, 403):
+            target = required_client_update(required_log)
+            if (target and target.get("channel") == channel and target.get("upload")
+                    and version_is_newer(target["version"], installed_version())):
+                return target["version"], target["upload"]
+            raise RuntimeError(f"Roblox restricts update checks for channel {channel}. Start Roblox and use its required-update dialog to install the version requested by the client.") from error
+        raise
+    return _validated_deployment(data)
 
 
 REPO_URL = "https://github.com/aubree-lat/MacOBlox.git"
@@ -322,10 +355,12 @@ def update_launcher(progress=None):
     return True, _("Mac O’ Blox updated. Restart it to use the new version.")
 
 
-def update_roblox(upload, progress=None):
+def update_roblox(upload, progress=None, expected_version=None):
     """Download the official macOS client and swap it in, keeping fast flags.
     The previous bundle is moved to backups/, and that path is returned (None
     when there was no client before). progress(fraction, text)."""
+    if not isinstance(upload, str) or not re.fullmatch(r"version-[0-9a-fA-F]{16,64}", upload):
+        raise RuntimeError("Invalid Roblox client upload identifier")
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
     archive = DOWNLOADS / f"{upload}-RobloxPlayer.zip"
     request = urllib.request.Request(DOWNLOAD_URL.format(upload=upload),
@@ -356,6 +391,11 @@ def update_roblox(upload, progress=None):
         new_bundle = unpack / "RobloxPlayer.app"
         if not new_bundle.is_dir():
             raise RuntimeError(_("The archive has no RobloxPlayer.app"))
+        if expected_version is not None:
+            with (new_bundle / "Contents" / "Info.plist").open("rb") as file:
+                downloaded = plistlib.load(file).get("CFBundleShortVersionString")
+            if downloaded != expected_version:
+                raise RuntimeError(f"Roblox download version mismatch: requested {expected_version}, received {downloaded}. The installed client was kept.")
         flags = load_fast_flags()
         old_version = installed_version() or "unknown"
         BACKUPS.mkdir(parents=True, exist_ok=True)
@@ -1051,15 +1091,62 @@ def signed_in():
                for c in cookies if isinstance(cookies, list))
 
 
-def exit_reason(log_path):
-    """A known cause for a game that quit, from its log, or None."""
+def _log_tail(log_path, limit=32768):
     try:
         with open(log_path, "rb") as file:
             file.seek(0, os.SEEK_END)
-            file.seek(max(0, file.tell() - 32768))
-            tail = file.read().decode(errors="replace")
+            file.seek(max(0, file.tell() - limit))
+            return file.read(limit).decode(errors="replace")
     except (OSError, TypeError):
+        return ""
+
+
+def required_client_update(log_path):
+    """Validated deployment requested by this client, including gated channels.
+
+    Do not forward logged URLs or authentication. Uploads are downloaded only
+    from our fixed official CDN URL, and their bundle version is checked before
+    replacing the installed client. A channel without a response is retained
+    so recovery cannot silently check the unrelated production deployment.
+    """
+    tail = _log_tail(log_path, 262144)
+    if ("flow end: app_closed_for_update" not in tail and
+            "Found new version and the updater launched. Drain reporting and quit." not in tail):
         return None
+    channels = re.findall(r"\[FLog::UpdateController\] UpdateController: versionQueryUrl: "
+                          r"https://clientsettingscdn\.roblox\.com/v2/client-version/MacPlayer"
+                          r"(?:/channel/([A-Za-z0-9_-]{1,64}))?(?=\s|$)", tail)
+    target = {"channel": channels[-1]} if channels else {}
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\[FLog::UpdateController\] version response:\s*", tail):
+        try:
+            data, _end = decoder.raw_decode(tail[match.end():match.end() + 4096])
+            version, upload = _validated_deployment(data)
+            target.update(version=version, upload=upload)
+        except (ValueError, TypeError):
+            continue
+    # A second launch can choose FORCE using a valid UpdateController cache
+    # without logging another network response. Never use another channel's
+    # cache (the production/zbeta mismatch is what caused this update loop).
+    if ("upload" not in target and "channel" in target and
+            "[FLog::UpdateController] Cache valid (" in tail and
+            "[FLog::UpdateController] Cache channel mismatch" not in tail):
+        for match in re.finditer(r'\[FLog::UpdateController\] channel: "([A-Za-z0-9_-]{0,64})", '
+                                 r'timestamp: \d+, json:\s*', tail):
+            if match.group(1) != target["channel"]:
+                continue
+            try:
+                data, _end = decoder.raw_decode(tail[match.end():match.end() + 4096])
+                version, upload = _validated_deployment(data)
+                target.update(version=version, upload=upload)
+            except (ValueError, TypeError):
+                continue
+    return target or None
+
+
+def exit_reason(log_path):
+    """A known cause for a game that quit, from its log, or None."""
+    tail = _log_tail(log_path)
     if ("flow end: app_closed_for_update" in tail or
             "Found new version and the updater launched. Drain reporting and quit." in tail):
         return "update_required"
@@ -1538,6 +1625,19 @@ def host_vram_bytes(renderer=None, adapter=None):
     return min(values) if values else 512 * 1024 * 1024
 
 
+@functools.lru_cache(maxsize=4)
+def _pwcat_raw_supported(program):
+    """PipeWire 1.0.x has pw-cat, but cannot consume our raw PCM FIFO."""
+    if not program:
+        return False
+    try:
+        help_text = subprocess.run([program, "--help"], capture_output=True, text=True,
+                                   env=dict(os.environ, LC_ALL="C"), timeout=2)
+        return help_text.returncode == 0 and "--raw" in help_text.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 class HostAudio:
     """Game sound played on the host. The shim writes raw float32 stereo
     44.1 kHz audio into a FIFO and pw-cat plays it through PipeWire, or pacat
@@ -1562,6 +1662,9 @@ class HostAudio:
         self.request = Path(str(self.input_fifo) + ".request")
         self.recorder = None
         self.recording = None
+        self.error_output = None
+        self.log_path = None
+        self.pulse_fallback = False
 
     def _keep_recording(self):
         wanted = None
@@ -1616,7 +1719,7 @@ class HostAudio:
     def _recorder_command(cls, fifo, rate, channels):
         runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
         pipewire = os.environ.get("PIPEWIRE_REMOTE") or (runtime / "pipewire-0").exists()
-        if pipewire and shutil.which("pw-cat"):
+        if pipewire and _pwcat_raw_supported(shutil.which("pw-cat")):
             return ["pw-cat", "--record", "--raw", "--format", "f32", "--rate", str(rate),
                     "--channels", str(channels), "--latency", "20ms", "--media-role", "Communication",
                     "-P", '{ application.name = "Roblox" application.icon-name = "macoblox" '
@@ -1629,14 +1732,34 @@ class HostAudio:
         return None
 
     @classmethod
-    def _spawn(cls, fifo):
-        command = cls._player_command(fifo)
+    def _spawn(cls, fifo, error_output=None, force_pulse=False):
+        command = cls._player_command(fifo, force_pulse=force_pulse)
+        if not command:
+            raise OSError("No compatible audio playback helper is installed")
         # Audio before the game (see PLAYER_NICE); `nice` takes a relative value.
         change = _nice_target(PLAYER_NICE) - os.getpriority(os.PRIO_PROCESS, 0)
         if change < 0 and shutil.which("nice"):
             command = ["nice", "-n", str(change), *command]
         return subprocess.Popen(
-            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=error_output if error_output is not None else subprocess.DEVNULL)
+
+    def _report_player_exit(self, status):
+        detail = ""
+        if self.error_output:
+            try:
+                self.error_output.seek(0)
+                detail = self.error_output.read(4096).decode(errors="replace").strip()
+                self.error_output.seek(0)
+                self.error_output.truncate()
+            except (OSError, ValueError):
+                detail = "playback error output unavailable"
+        if self.log_path:
+            try:
+                with open(self.log_path, "ab") as log:
+                    log.write(f"[MacOBlox Audio] Playback helper exited with code {status}; {detail or 'no error output'}\n".encode())
+            except OSError:
+                pass
 
     def keep_playing(self):
         """Restart the player if it has exited (PipeWire restarted, say):
@@ -1645,20 +1768,26 @@ class HostAudio:
             if self._stopped:
                 return
             self._keep_recording()
-            if self.player.poll() is None or time.monotonic() - self.restarted_at < 5:
+            status = self.player.poll()
+            if status is None or time.monotonic() - self.restarted_at < 5:
                 return
             self.restarted_at = time.monotonic()
-            if self._player_command(self.fifo):
+            self._report_player_exit(status)
+            # PipeWire's PulseAudio server is also usable when native playback
+            # initialization fails. Keep the fallback for this game session.
+            if shutil.which("pacat"):
+                self.pulse_fallback = True
+            if self._player_command(self.fifo, force_pulse=self.pulse_fallback):
                 try:
-                    self.player = self._spawn(self.fifo)
+                    self.player = self._spawn(self.fifo, self.error_output, self.pulse_fallback)
                 except OSError:
                     pass
 
     @classmethod
-    def _player_command(cls, fifo):
+    def _player_command(cls, fifo, force_pulse=False):
         runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
         pipewire = os.environ.get("PIPEWIRE_REMOTE") or (runtime / "pipewire-0").exists()
-        if pipewire and shutil.which("pw-cat"):
+        if not force_pulse and pipewire and _pwcat_raw_supported(shutil.which("pw-cat")):
             return ["pw-cat", "--playback", "--raw", "--format", "f32", "--rate", "44100",
                     "--channels", "2", "--latency", "40ms", "--media-role", "Game",
                     "-P", '{ application.name = "Roblox" application.icon-name = "macoblox" '
@@ -1678,6 +1807,7 @@ class HostAudio:
         fifo = CACHE_DIR / f"audio-{os.getpid()}.fifo"
         audio = cls(fifo)
         try:
+            audio.error_output = tempfile.TemporaryFile(dir=CACHE_DIR)
             fifo.unlink(missing_ok=True)
             os.mkfifo(fifo, 0o600)
             audio._owned_paths.add(fifo)
@@ -1689,7 +1819,7 @@ class HostAudio:
                     pass
             os.mkfifo(audio.input_fifo, 0o600)
             audio._owned_paths.add(audio.input_fifo)
-            audio.player = cls._spawn(fifo)
+            audio.player = cls._spawn(fifo, audio.error_output)
             return audio
         except BaseException:
             audio.stop()
@@ -1718,6 +1848,9 @@ class HostAudio:
                     pass
             player, self.player = self.player, None
             self._stop_process(player)
+            if self.error_output:
+                self.error_output.close()
+                self.error_output = None
             if self.fifo in self._owned_paths:
                 try:
                     self.fifo.unlink()
@@ -1821,6 +1954,7 @@ class RobloxSession:
         if self.dns:
             variables.append(f"MACOBLOX_DNS={self.dns.address}")
         if self.audio:
+            variables.append(f"MACOBLOX_AUDIO={os.environ.get('MACOBLOX_AUDIO', '1')}")
             variables.append(f"MACOBLOX_AUDIO_FIFO=/Volumes/SystemRoot{self.audio.fifo}")
             variables.append(f"MACOBLOX_AUDIO_INPUT_FIFO=/Volumes/SystemRoot{self.audio.input_fifo}")
         else:
@@ -1913,6 +2047,8 @@ class RobloxSession:
         (CACHE_DIR / "roblox-tmp").mkdir(parents=True, exist_ok=True)
         cleanup_logs(int(self.settings.get("keep_logs", 30)) - 1)
         self.log_path = LOGS / time.strftime("launch-%Y%m%d-%H%M%S.log")
+        if self.audio:
+            self.audio.log_path = self.log_path
         # Truncate for this launch, but keep O_APPEND on the inherited file
         # description: guest output must not overwrite a host lifecycle record.
         with open(self.log_path, "wb", opener=lambda path, flags:
@@ -1929,6 +2065,14 @@ class RobloxSession:
                 "prebuilt" if PREBUILT_SHIM else "source")
             version = re.sub(r"[^A-Za-z0-9._+-]", "?", (installed_version() or "unknown")[:80])
             log.write(f"Packaging: {packaging}; Roblox version: {version}\n".encode())
+            channel = self.settings.get("roblox_channel", "")
+            channel = re.sub(r"[^A-Za-z0-9_-]", "?", channel[:64]) if isinstance(channel, str) else "invalid"
+            log.write(f"Launcher update channel: {channel or 'Production (default)'}\n".encode())
+            if self.audio:
+                command = self.audio._player_command(self.audio.fifo)
+                log.write(f"Audio playback helper: {command[0] if command else 'unavailable'}\n".encode())
+            else:
+                log.write(b"Audio unavailable: install pacat (pulseaudio-utils on Mint/Ubuntu), or pw-cat with --raw support.\n")
             if leftover:
                 log.write(f"Requested cleanup of {len(leftover)} selected-prefix Roblox process(es) of an earlier game\n".encode())
             if orphans:
