@@ -7,8 +7,8 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
   exit 2
 fi
 packaging_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-version=0.21
-checksum=d269a2fe5e77f6d9dfe6f9ad1281044aecb6affb868cbd9478e9efb37c21450e
+version=0.21patch1
+checksum=60eb49b8719e0db8043e253e2e6a3c3ea9ff8029e740cd34013bb0863bf53410
 output=$(realpath -m -- "$1")
 [[ ! -e $output ]] || {
   printf 'Output already exists: %s\n' "$output" >&2

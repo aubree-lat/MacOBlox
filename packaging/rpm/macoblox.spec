@@ -1,5 +1,5 @@
 Name:           macoblox
-Version:        0.21
+Version:        0.21patch1
 Release:        1%{?dist}
 Summary:        Run the macOS Roblox client on Linux through Darling
 License:        MIT AND OFL-1.1
@@ -87,5 +87,8 @@ python3 -m compileall -q -d "%{_datadir}/macoblox/launcher" "%{buildroot}%{_data
 %{_datadir}/mime/packages/wtf.aubree.MacOBlox.xml
 
 %changelog
+* Wed Oct 07 2026 MacOBlox maintainers <noreply@aubree.wtf> - 0.21patch1-1
+- Update scaled input, X11 capture, cursor overlay and Roblox 0.742 transport compatibility.
+
 * Tue Oct 06 2026 MacOBlox maintainers <noreply@aubree.wtf> - 0.21-1
 - Initial Fedora and openSUSE package with prebuilt shims and desktop integration.

@@ -1,7 +1,7 @@
 # Maintainer: aubree.wtf <https://aubree.wtf/>
 pkgname=macoblox-git
 _name=MacOBlox
-pkgver=0.21.r0.gc8c5648
+pkgver=0.21patch1.r0.gddcba98
 pkgrel=1
 pkgdesc="Run the macOS Roblox client on Linux through Darling"
 arch=('x86_64')

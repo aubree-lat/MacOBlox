@@ -4,7 +4,7 @@ Two independent recipes are ready for AUR repositories:
 
 | Package | Recipe | Source |
 | --- | --- | --- |
-| `macoblox` | `macoblox/PKGBUILD` and `macoblox/.SRCINFO` | Checked release archive, currently 0.21 |
+| `macoblox` | `macoblox/PKGBUILD` and `macoblox/.SRCINFO` | Checked release archive, currently 0.21patch1 |
 | `macoblox-git` | `PKGBUILD` and `.SRCINFO` | Current GitHub checkout |
 
 The recipes build the Darling shim and native Wayland helper during package

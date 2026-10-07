@@ -1,6 +1,6 @@
 # Native distro packages
 
-These are package recipes for the published **0.21** release. Each package
+These are package recipes for the published **0.21patch1** release. Each package
 builds the shim and native Wayland helper during packaging, installs desktop
 and link handlers, and downloads Roblox on first setup. Personal settings and
 sign-in are stored in the user's directories. The website and user logs are
@@ -51,12 +51,12 @@ From the MacOBlox checkout:
 ./packaging/prepare-source.sh "$PWD/work/native-packages"
 ```
 
-This downloads the checksum-verified 0.21 release and places the Debian
+This downloads the checksum-verified 0.21patch1 release and places the Debian
 overlay and RPM inputs in a new output directory. It requires `curl`, `tar`
 and `sha256sum`. To use an already downloaded release archive:
 
 ```bash
-./packaging/prepare-source.sh "$PWD/work/native-packages" /path/to/v0.21.tar.gz
+./packaging/prepare-source.sh "$PWD/work/native-packages" /path/to/v0.21patch1.tar.gz
 ```
 
 The output directory must not already exist. Arch builds use their own AUR
@@ -72,7 +72,7 @@ Then install the packaging tools and native development dependencies:
 ```bash
 sudo apt install build-essential debhelper dh-python python3 clang lld \
   pkg-config libsdl2-dev libwayland-dev
-cd work/native-packages/MacOBlox-0.21
+cd work/native-packages/MacOBlox-0.21patch1
 dpkg-buildpackage -b -us -uc
 ```
 
@@ -81,7 +81,7 @@ one directory above the source directory. Install using `apt`, which resolves
 dependencies from the configured repositories:
 
 ```bash
-sudo apt install ../macoblox_0.21-1_amd64.deb
+sudo apt install ../macoblox_0.21patch1-1_amd64.deb
 ```
 
 The recipe uses debhelper for Python bytecode and desktop/icon/MIME cache
