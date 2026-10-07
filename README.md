@@ -22,7 +22,7 @@ its Windows version through Wine. English and Russian.
 
 ## Install
 
-Version **0.21** is a source release. Use the installer below to install or update.
+Version **0.21patch1** is a source release. Use the installer below to install or update.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
@@ -215,6 +215,25 @@ custom fast flags before testing scaling.
 
 Custom scaling requires a supported client input layout. If the launch log
 says **UI scale skipped**, the client keeps its original surface scale.
+The scaling handoffs cover pointer movement, clicks and scrolling, including
+the mouse position used during first-person lock. Camera motion retains its
+original relative deltas.
+</details>
+
+<details>
+<summary>Error 256 or an unknown connection error when joining a server</summary>
+
+Update MacOBlox and restart Roblox. The launcher applies verified RakNet
+compatibility patches for Roblox **0.741.0.7411056** and **0.742.0.7421053**.
+The launch log includes **RakNet compatibility** and **Roblox version**.
+If compatibility says **unsupported client**, share those lines and the full
+launch log so that deployment can be inspected. Unsupported executables are
+left unchanged.
+
+Restoring an older client backup can trigger Roblox's required-update check.
+The launcher follows the deployment requested by the client; downgrading is
+not a lasting repair. If the compatibility patch is already applied and the
+error persists, the full log is needed to diagnose that connection failure.
 </details>
 
 <details>
@@ -309,7 +328,7 @@ how to open the `roblox-studio-auth` link, choose **Roblox Studio (Mac O’ Blox
 
 The Flatpak brings Darling along and runs it without root (see
 [flatpak/darling-noroot.c](flatpak/darling-noroot.c)), so nothing has to be
-installed on the system. Version 0.21 does not include a Flatpak bundle.
+installed on the system. Version 0.21patch1 does not include a Flatpak bundle.
 The last testing bundle is available in
 [release 0.19](https://github.com/aubree-lat/MacOBlox/releases/tag/v0.19):
 

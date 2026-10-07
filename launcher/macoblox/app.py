@@ -1194,7 +1194,7 @@ class SettingsPage(Adw.Bin):
         ui_scale = Adw.SpinRow.new_with_range(100, 400, 25)
         ui_scale.set_digits(0)
         ui_scale.set_title(_("Roblox UI scale"))
-        ui_scale.set_subtitle(_("100–400%. Applies on next launch."))
+        ui_scale.set_subtitle(_("100–400%. Keeps the display resolution. Applies on next launch."))
         ui_scale.set_value(validated_dpi_scale(settings.get("dpi_scale", 1.0)) * 100)
         ui_scale.connect("notify::value", lambda row, _pspec: window.set_setting(
             "dpi_scale", validated_dpi_scale(row.get_value() / 100)))

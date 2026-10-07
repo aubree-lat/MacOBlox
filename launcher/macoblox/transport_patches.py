@@ -1,6 +1,7 @@
 """Verified RakNet compatibility patches for known client executables.
 
-Offsets and instructions were inspected in the x86_64 7411056 release.
+Offsets and instructions were inspected in the x86_64 7411056 and 7421053
+releases downloaded from Roblox's deployment CDN.
 Normalize only the listed patches before checking the complete executable's
 SHA-256. A client update or an unexpected modification is unsupported; no
 heuristic search or partial application is allowed.
@@ -39,7 +40,20 @@ RELEASES = (Release(
         Site(0x5370A1E, b"\x75", b"\xeb", "dummy connection second caller"),
     ),
     (Site(0x1153F70, b"\x89\xf3", b"\x31\xdb", "startup throttle"),),
-),)
+), Release(
+    # 0.742.0.7421053, official upload version-f9247f9560044102.
+    # Each relocated site was inspected with its branch target and flag;
+    # the size/hash below describe the pristine executable in that archive.
+    125285200,
+    "ac9ad59b3aa3805bf2d1c89fb6ff9c7941bf2e57af17a81cbc26abe94a022c47",
+    (
+        Site(0x4B5D12B, bytes.fromhex("554889e5"), bytes.fromhex("31c0c390"), "transport selection"),
+        Site(0x54B2F8D, b"\x01", b"\xff", "fallback connection"),
+        Site(0x54B4B80, b"\x75", b"\xeb", "dummy connection first caller"),
+        Site(0x54B4D46, b"\x75", b"\xeb", "dummy connection second caller"),
+    ),
+    (Site(0x11A21C8, b"\x89\xf3", b"\x31\xdb", "startup throttle"),),
+))
 
 
 def plan_transport_patch(data, releases=RELEASES):

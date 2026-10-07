@@ -13,6 +13,7 @@ extern void *dlsym(void *, const char *);
 #include <stdlib.h>
 #include <dlfcn.h>
 #endif
+#include "shim_lock.h"
 
 typedef unsigned long XID;
 typedef struct {
@@ -80,9 +81,64 @@ static XID overlay, parent, colormap;
 static int anchor_x, anchor_y;
 static unsigned long last_serial;
 static unsigned long lock_generation;
+static int last_image_from_selection;
 static CursorErrorHandler previous_error_handler;
 static void *(*host_calloc)(unsigned long, unsigned long);
 static void (*host_free)(void *);
+
+/* XFixesGetCursorImage returns the image under the physical pointer. During
+ * lock that pointer can be over an invisible rendering child, while the
+ * visible cursor belongs at the logical lock position. Keep the bitmap from
+ * the selected AppKit cursor instead. The mailbox holds at most one image. */
+static volatile unsigned int selected_image_lock;
+static unsigned int *selected_pixels;
+static XID selected_cursor;
+static unsigned int selected_width, selected_height, selected_hot_x, selected_hot_y;
+static unsigned long selected_image_generation;
+
+void macoblox_cursor_overlay_select_image(XID cursor, const unsigned int *pixels,
+                                          unsigned int width, unsigned int height,
+                                          unsigned int hot_x, unsigned int hot_y) {
+    unsigned int *copy = 0;
+    if (cursor && pixels && width && height && width <= 512 && height <= 512) {
+        copy = malloc(width * height * sizeof *copy);
+        if (copy)
+            for (unsigned int index = 0; index < width * height; index++) copy[index] = pixels[index];
+    }
+    macoblox_lock(&selected_image_lock);
+    unsigned int *previous = selected_pixels;
+    selected_pixels = copy;
+    selected_cursor = copy ? cursor : 0;
+    selected_width = copy ? width : 0;
+    selected_height = copy ? height : 0;
+    selected_hot_x = hot_x < width ? hot_x : 0;
+    selected_hot_y = hot_y < height ? hot_y : 0;
+    selected_image_generation++;
+    macoblox_unlock(&selected_image_lock);
+    free(previous);
+}
+
+static CursorImage *selected_image_snapshot(XID cursor) {
+    CursorImage *image = 0;
+    macoblox_lock(&selected_image_lock);
+    if (cursor && cursor == selected_cursor && selected_pixels) {
+        unsigned int count = selected_width * selected_height;
+        image = malloc(sizeof *image + count * sizeof(unsigned long));
+        if (image) {
+            *image = (CursorImage){.width = selected_width, .height = selected_height,
+                .xhot = selected_hot_x, .yhot = selected_hot_y,
+                .serial = selected_image_generation, .pixels = (unsigned long *)(image + 1)};
+            for (unsigned int index = 0; index < count; index++) image->pixels[index] = selected_pixels[index];
+        }
+    }
+    macoblox_unlock(&selected_image_lock);
+    return image;
+}
+
+static void release_cursor_image(CursorImage *image, int from_selection) {
+    if (from_selection) free(image);
+    else p_XFree(image);
+}
 
 static int overlay_error(void *connection, void *error) {
     /* The game can destroy its window while the worker handles an update.
@@ -152,7 +208,7 @@ static int resolve(void) {
  * worker may run after motion/recentering, so cursor->x/y are not that point. */
 static int cursor_overlay_update(int locked, XID game_window, int visible,
                                  int saved_position, int saved_x, int saved_y,
-                                 unsigned long generation) {
+                                 unsigned long generation, XID cursor_id) {
     if (!locked || !game_window) {
         if (display && overlay) {
             p_XUnmapWindow(display, overlay);
@@ -170,17 +226,20 @@ static int cursor_overlay_update(int locked, XID game_window, int visible,
         p_XFlush(display);
         return 1;
     }
-    CursorImage *cursor = p_XFixesGetCursorImage(display);
+    CursorImage *cursor = selected_image_snapshot(cursor_id);
+    int from_selection = cursor != 0;
+    if (!cursor) cursor = p_XFixesGetCursorImage(display);
     if (!cursor) return 0;
     int anchor_changed = saved_position &&
         (lock_generation != generation || anchor_x != saved_x || anchor_y != saved_y);
-    if (parent == game_window && last_serial == cursor->serial && !anchor_changed) {
-        p_XFree(cursor);
+    if (parent == game_window && last_serial == cursor->serial &&
+        last_image_from_selection == from_selection && !anchor_changed) {
+        release_cursor_image(cursor, from_selection);
         return 1;
     }
     unsigned int width = cursor->width, height = cursor->height;
-    if (!width || !height || width > 256 || height > 256) {
-        p_XFree(cursor);
+    if (!width || !height || width > 512 || height > 512) {
+        release_cursor_image(cursor, from_selection);
         return 0;
     }
     if (saved_position) {
@@ -191,7 +250,7 @@ static int cursor_overlay_update(int locked, XID game_window, int visible,
         XID child;
         if (!p_XTranslateCoordinates(display, p_XDefaultRootWindow(display), game_window,
                                      cursor->x, cursor->y, &anchor_x, &anchor_y, &child)) {
-            p_XFree(cursor);
+            release_cursor_image(cursor, from_selection);
             return 0;
         }
     }
@@ -217,7 +276,7 @@ static int cursor_overlay_update(int locked, XID game_window, int visible,
         if (image) p_XDestroyImage(image);
         else if (pixels) host_free(pixels);
         free(rects);
-        p_XFree(cursor);
+        release_cursor_image(cursor, from_selection);
         return 0;
     }
     int count = 0;
@@ -245,7 +304,8 @@ static int cursor_overlay_update(int locked, XID game_window, int visible,
     p_XFreePixmap(display, pixmap);
     p_XDestroyImage(image);
     last_serial = cursor->serial;
-    p_XFree(cursor);
+    last_image_from_selection = from_selection;
+    release_cursor_image(cursor, from_selection);
     free(rects);
     p_XFlush(display);
     return 1;
@@ -253,11 +313,17 @@ static int cursor_overlay_update(int locked, XID game_window, int visible,
 
 int macoblox_cursor_overlay_update_at(int locked, XID game_window, int visible,
                                       int saved_x, int saved_y, unsigned long generation) {
-    return cursor_overlay_update(locked, game_window, visible, 1, saved_x, saved_y, generation);
+    return cursor_overlay_update(locked, game_window, visible, 1, saved_x, saved_y, generation, 0);
+}
+
+int macoblox_cursor_overlay_update_selected(int locked, XID game_window, int visible,
+                                            int saved_x, int saved_y,
+                                            unsigned long generation, XID cursor) {
+    return cursor_overlay_update(locked, game_window, visible, 1, saved_x, saved_y, generation, cursor);
 }
 
 /* Keep the standalone helper interface for callers without a capture
- * snapshot. The game shim always uses update_at with the saved position. */
+ * snapshot. The game shim uses update_selected with the saved position. */
 int macoblox_cursor_overlay_update(int locked, XID game_window, int visible) {
-    return cursor_overlay_update(locked, game_window, visible, 0, 0, 0, 0);
+    return cursor_overlay_update(locked, game_window, visible, 0, 0, 0, 0, 0);
 }

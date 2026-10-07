@@ -2,7 +2,7 @@
 #define MACOBLOX_INPUT_SCALE_HOOK_H
 
 /* InputCapture caches physical, top-left points for AppKit cursor warps.
- * Its two Mac engine wrappers are the first boundary where only the engine
+ * Its Mac engine wrappers are the first boundary where only the engine
  * needs those points in the artificial screen-DPI coordinate space. Keep
  * the original effective-UI-scale conversion and raw dx/dy in the engine. */
 extern Method *class_copyMethodList(Class, unsigned int *);
@@ -18,6 +18,8 @@ static void (*macoblox_mouse_move_inner)(void *, const void *, int,
                                          float, float, float, float);
 static void (*macoblox_mouse_button_inner)(void *, const void *, int, int,
                                            int, int, int);
+static void (*macoblox_mouse_scroll_inner)(void *, const void *, const void *);
+static void (*macoblox_mouse_position_override)(id, SEL, int, int);
 
 static void macoblox_input_scale_set(double scale) {
     union { double value; unsigned long long bits; } factor = { .value = scale };
@@ -47,6 +49,33 @@ static void macoblox_scaled_mouse_button(void *engine, int x, int y,
     macoblox_mouse_button_inner(engine, macoblox_mouse_source,
                                 (int)(x / factor), (int)(y / factor),
                                 button, pressed, click_count_offset);
+}
+
+/* Scroll/magnification events cache the same physical position as clicks.
+ * Their verified handoff is a 32-byte record. Transform only its X/Y;
+ * wheel amounts, phases, buttons and other bytes retain their values. */
+static void macoblox_scaled_mouse_scroll(void *engine, const void *event) {
+    union { unsigned char bytes[32]; float components[8]; } copy;
+    __builtin_memcpy(copy.bytes, event, sizeof(copy.bytes));
+    double factor = macoblox_input_scale_get();
+    copy.components[0] = (float)(copy.components[0] / factor);
+    copy.components[1] = (float)(copy.components[1] / factor);
+    macoblox_mouse_scroll_inner(engine, macoblox_mouse_source, copy.bytes);
+}
+
+/* Engine-originated position overrides are in the scaled coordinate space.
+ * Keep InputCapture's cache physical, as for ordinary pointer events. Its
+ * subsequent click/scroll handoffs then divide by the extra scale once. */
+static void macoblox_scaled_position_override(id self, SEL cmd, int x, int y) {
+    double factor = macoblox_input_scale_get();
+    double physical_x = x * factor, physical_y = y * factor;
+    if (__builtin_isfinite(physical_x) && __builtin_isfinite(physical_y) &&
+        physical_x >= -2147483648.0 && physical_x <= 2147483647.0 &&
+        physical_y >= -2147483648.0 && physical_y <= 2147483647.0) {
+        x = (int)physical_x;
+        y = (int)physical_y;
+    }
+    macoblox_mouse_position_override(self, cmd, x, y);
 }
 
 static int macoblox_input_string_equal(const char *left, const char *right) {
@@ -370,6 +399,74 @@ static int macoblox_input_inner_abi(const MacOBloxInputImage *image,
         macoblox_input_relative(helper + 14) == service;
 }
 
+static int macoblox_input_scroll_wrapper(const MacOBloxInputImage *image,
+                                         const unsigned char *wrapper,
+                                         void **source, void **inner) {
+    static const unsigned char head[] = {0x55,0x48,0x89,0xe5,0x48,0x89,0xf2,0x48,0x8d,0x35};
+    static const unsigned char tail[] = {0x5d,0xe9};
+    if (!macoblox_input_range(image, (unsigned long)wrapper, 20, 5) ||
+        macoblox_input_function_size(image, wrapper) < 20 ||
+        !macoblox_input_bytes(wrapper, head, sizeof(head)) ||
+        !macoblox_input_bytes(wrapper + 14, tail, sizeof(tail))) return 0;
+    *source = (void *)macoblox_input_relative(wrapper + 10);
+    *inner = (void *)macoblox_input_relative(wrapper + 16);
+    static const unsigned char inner_head[] = {
+        0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x48,0x83,0xec,0x38,
+        0x49,0x89,0xf7,0x48,0x89,0xfb,0x0f,0x10,0x02,0x0f,0x10,0x4a,0x10,
+        0x4c,0x8d,0x75,0xb0,0x41,0x0f,0x29,0x4e,0x10,0x41,0x0f,0x29,0x06,
+        0x4c,0x89,0xf6,0xe8};
+    const unsigned char *function = *inner;
+    if (!macoblox_input_range(image, (unsigned long)*source, 24, 1) ||
+        macoblox_input_range(image, (unsigned long)*source, 24, 4) ||
+        !macoblox_input_range(image, (unsigned long)function, 47, 5) ||
+        macoblox_input_function_size(image, function) < 47 ||
+        !macoblox_input_bytes(function, inner_head, sizeof(inner_head))) return 0;
+    const unsigned char *helper = (const unsigned char *)macoblox_input_relative(function + 43);
+    static const unsigned char helper_head[] = {0x55,0x48,0x89,0xe5,0x53,0x50,0x48,0x89,0xf3,0xe8};
+    static const unsigned char helper_scale[] = {0xf3,0x0f,0x10,0x88,0xb0,0x04,0x00,0x00};
+    return macoblox_input_range(image, (unsigned long)helper, 27, 5) &&
+        macoblox_input_function_size(image, helper) >= 27 &&
+        macoblox_input_bytes(helper, helper_head, sizeof(helper_head)) &&
+        macoblox_input_bytes(helper + 19, helper_scale, sizeof(helper_scale)) &&
+        macoblox_input_relative(helper + 10) ==
+            macoblox_input_relative((const unsigned char *)macoblox_mouse_move_inner + 63);
+}
+
+static unsigned char *macoblox_input_find_scroll_wrapper(const MacOBloxInputImage *image,
+                                                         Method method) {
+    const unsigned char *function = (const unsigned char *)method_getImplementation(method);
+    unsigned long length = macoblox_input_function_size(image, function);
+    if (length < 12 || length > 4096 ||
+        !macoblox_input_range(image, (unsigned long)function, length, 5)) return 0;
+    unsigned char *found = 0;
+    for (unsigned long index = 7; index + 5 <= length; index++) {
+        if (function[index] != 0xe8 || function[index-7] != 0x48 ||
+            function[index-6] != 0x8d || function[index-5] != 0x75 ||
+            function[index-3] != 0x48 || function[index-2] != 0x89 || function[index-1] != 0xc7)
+            continue;
+        unsigned char *target = (unsigned char *)macoblox_input_relative(function + index + 1);
+        void *source, *inner;
+        if (!macoblox_input_scroll_wrapper(image, target, &source, &inner)) continue;
+        if (found) return 0;
+        found = target;
+    }
+    return found;
+}
+
+static int macoblox_input_override_abi(const MacOBloxInputImage *image, Method method) {
+    const unsigned char *function = (const unsigned char *)method_getImplementation(method);
+    static const unsigned char head[] = {
+        0x55,0x48,0x89,0xe5,0xf2,0x0f,0x2a,0xc2,0xf2,0x0f,0x2a,0xc9,0x48,0x8b,0x05};
+    static const unsigned char tail[] = {
+        0xf2,0x0f,0x11,0x04,0x07,0xf2,0x0f,0x11,0x4c,0x07,0x08,0x5d,0xc3};
+    if (!macoblox_input_range(image, (unsigned long)function, 32, 5) ||
+        macoblox_input_function_size(image, function) != 32 ||
+        !macoblox_input_bytes(function, head, sizeof(head)) ||
+        !macoblox_input_bytes(function + 19, tail, sizeof(tail))) return 0;
+    unsigned long offset = macoblox_input_relative(function + 15);
+    return macoblox_input_range(image, offset, sizeof(unsigned long), 1);
+}
+
 static void macoblox_input_jump(unsigned char *entry, const void *replacement) {
     static const unsigned char jump[] = {0xff,0x25,0x00,0x00,0x00,0x00};
     __builtin_memcpy(entry, jump, sizeof(jump));
@@ -385,7 +482,10 @@ static int macoblox_install_input_scale_hooks(void) {
     Method entered = macoblox_input_owned_method(cls, "handleMouseEntered:", "v24@0:8@16");
     Method button = macoblox_input_owned_method(cls, "handleMouseButtonEvent:isPressed:", "v28@0:8@16c24");
     Method software = macoblox_input_owned_method(cls, "transitionToSoftwareIconCursor", "i16@0:8");
-    if (!move || !entered || !button || !software) return -1;
+    Method scroll = macoblox_input_owned_method(cls, "handleScroll:", "v24@0:8@16");
+    Method magnify = macoblox_input_owned_method(cls, "handleMagnification:", "v24@0:8@16");
+    Method override = macoblox_input_owned_method(cls, "mousePositionOverridePosX:Y:", "v24@0:8i16i20");
+    if (!move || !entered || !button || !software || !scroll || !magnify || !override) return -1;
     MacOBloxInputImage image = {0};
     if (!macoblox_input_image(&image) || !macoblox_input_find_dpi_override(&image)) return -1;
     unsigned char *move_wrapper = (unsigned char *)macoblox_input_find_wrapper(
@@ -401,16 +501,31 @@ static int macoblox_install_input_scale_hooks(void) {
         !macoblox_input_wrapper(&image, button_wrapper, 1, &button_source, &button_inner) ||
         move_source != button_source ||
         !macoblox_input_inner_abi(&image, move_inner, button_inner)) return -1;
+    /* Used only by the validation of the shared effective-UI-scale helper. */
+    macoblox_mouse_move_inner = (void (*)(void *, const void *, int, float, float, float, float))move_inner;
+    unsigned char *scroll_wrapper = macoblox_input_find_scroll_wrapper(&image, scroll);
+    void *scroll_source, *scroll_inner;
+    if (!scroll_wrapper || scroll_wrapper == move_wrapper || scroll_wrapper == button_wrapper ||
+        macoblox_input_find_scroll_wrapper(&image, magnify) != scroll_wrapper ||
+        !macoblox_input_scroll_wrapper(&image, scroll_wrapper, &scroll_source, &scroll_inner) ||
+        scroll_source != move_source || !macoblox_input_override_abi(&image, override)) {
+        write_str("[MacOBlox] UI scale skipped: unsupported scroll or locked mouse position handoff\n");
+        return -1;
+    }
     int page_size = getpagesize();
     if (page_size < 4096 || page_size > 65536 || (page_size & (page_size - 1))) return -1;
     unsigned long mask = (unsigned long)page_size - 1;
-    unsigned long pages[2] = {(unsigned long)move_wrapper & ~mask,
-                              (unsigned long)button_wrapper & ~mask};
+    unsigned long pages[3] = {(unsigned long)move_wrapper & ~mask,
+                              (unsigned long)button_wrapper & ~mask,
+                              (unsigned long)scroll_wrapper & ~mask};
     if (((unsigned long)move_wrapper & mask) > mask - 13 ||
         ((unsigned long)button_wrapper & mask) > mask - 13 ||
+        ((unsigned long)scroll_wrapper & mask) > mask - 13 ||
         !macoblox_input_range(&image, pages[0], page_size, 5) ||
-        !macoblox_input_range(&image, pages[1], page_size, 5)) return -1;
+        !macoblox_input_range(&image, pages[1], page_size, 5) ||
+        !macoblox_input_range(&image, pages[2], page_size, 5)) return -1;
     unsigned int page_count = pages[0] == pages[1] ? 1 : 2;
+    if (pages[2] != pages[0] && pages[2] != pages[1]) pages[page_count++] = pages[2];
     for (unsigned int index = 0; index < page_count; ++index)
         if (mprotect((void *)pages[index], page_size, 7)) {
             for (unsigned int previous = 0; previous < index; ++previous)
@@ -421,18 +536,24 @@ static int macoblox_install_input_scale_hooks(void) {
     macoblox_mouse_source = move_source;
     macoblox_mouse_move_inner = (void (*)(void *, const void *, int, float, float, float, float))move_inner;
     macoblox_mouse_button_inner = (void (*)(void *, const void *, int, int, int, int, int))button_inner;
+    macoblox_mouse_scroll_inner = (void (*)(void *, const void *, const void *))scroll_inner;
+    macoblox_mouse_position_override = (void (*)(id, SEL, int, int))method_getImplementation(override);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     macoblox_input_jump(move_wrapper, (const void *)macoblox_scaled_mouse_move);
     macoblox_input_jump(button_wrapper, (const void *)macoblox_scaled_mouse_button);
+    macoblox_input_jump(scroll_wrapper, (const void *)macoblox_scaled_mouse_scroll);
     __builtin___clear_cache((char *)move_wrapper, (char *)move_wrapper + 14);
     __builtin___clear_cache((char *)button_wrapper, (char *)button_wrapper + 14);
+    __builtin___clear_cache((char *)scroll_wrapper, (char *)scroll_wrapper + 14);
     int restored = 1;
     for (unsigned int index = 0; index < page_count; ++index)
         if (mprotect((void *)pages[index], page_size, 5)) restored = 0;
-    /* Both adapters are safe passthroughs at 1x if permission restoration
+    /* The adapters are safe passthroughs at 1x if permission restoration
      * fails. Keep synthetic UI scaling disabled in that failure case. */
     if (!restored)
         write_str("[MacOBlox] UI scale disabled: client text protection restore failed; mouse adapters remain 1x\n");
+    if (restored)
+        method_setImplementation(override, (IMP)macoblox_scaled_position_override);
     return restored ? 1 : -2;
 }
 #else

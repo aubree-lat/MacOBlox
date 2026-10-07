@@ -551,11 +551,16 @@ def ensure_raknet_transport():
             from .transport_patches import apply_transport_patch
             status = apply_transport_patch(binary)
             if status.startswith("unsupported"):
+                data = binary.read_bytes()
+                status += f"; size={len(data)}; sha256={hashlib.sha256(data).hexdigest()}"
                 logging.getLogger("macoblox").warning("RakNet compatibility: %s", status)
             elif status == "patched":
                 logging.getLogger("macoblox").info("Verified RakNet compatibility patches applied")
+            return status
+        return "client not installed"
     except Exception as e:
         logging.getLogger("macoblox").warning("Failed to ensure RakNet transport: %s", e)
+        return f"compatibility preparation failed: {e}"
 
 
 def ensure_shader_compatibility():
@@ -2031,7 +2036,7 @@ class RobloxSession:
         except Exception as e:
             logging.getLogger("macoblox").warning("Failed to apply mods: %s", e)
         apply_throttle_patch()
-        ensure_raknet_transport()
+        transport_status = ensure_raknet_transport()
         ensure_shader_compatibility()
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
@@ -2065,6 +2070,7 @@ class RobloxSession:
                 "prebuilt" if PREBUILT_SHIM else "source")
             version = re.sub(r"[^A-Za-z0-9._+-]", "?", (installed_version() or "unknown")[:80])
             log.write(f"Packaging: {packaging}; Roblox version: {version}\n".encode())
+            log.write(f"RakNet compatibility: {transport_status}\n".encode())
             channel = self.settings.get("roblox_channel", "")
             channel = re.sub(r"[^A-Za-z0-9_-]", "?", channel[:64]) if isinstance(channel, str) else "invalid"
             log.write(f"Launcher update channel: {channel or 'Production (default)'}\n".encode())

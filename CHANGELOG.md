@@ -1,7 +1,30 @@
 # Release notes
 
-## Unreleased
+## 0.21patch1 — 2026-10-07
 
+- Extend custom Roblox UI scaling to scroll/magnification positions and
+  engine-originated mouse position overrides. Keep the AppKit mouse cache
+  in physical coordinates during first-person lock; apply the extra UI scale
+  once at each engine handoff. Validate the additional client methods and
+  instruction layouts before enabling scaling.
+- Replace the X11 locked-pointer fallback's guessed warp deltas with native
+  positions and X request serials. Batch pointer deltas like raw motion,
+  distinguish motion queued before and after recentering, and fall back
+  after 100 ms of missing raw input when physical motion was observed.
+  Match raw/core server timestamps and ignore motion queued before selection
+  so stopping the mouse does not disable a working raw stream.
+  Negotiate XI2 per connection and release acquired event cookies.
+- Keep the selected AppKit cursor bitmap for the X11 locked-cursor overlay,
+  avoiding snapshots of a different or invisible cursor under the confined
+  physical pointer. Preserve image dimensions and bitmap hot spots.
+- Add checksum-verified transport compatibility patches for Roblox
+  0.742.0.7421053, including its relocated transport selection, fallback and
+  dummy-connection branches. Accept the existing startup-throttle patch when
+  verifying the executable. Write the transport patch status into each launch
+  log, including the executable size and hash for unsupported clients.
+  These changes build; gameplay on the reporting systems still needs
+  confirmation. The reported whole-game freezes and disconnections have not
+  been reproduced, and full logs are still needed to identify their causes.
 - Decode native Wayland custom cursors directly from their source bitmap,
   sharing the X11 decoder instead of drawing through Darling's image
   compositing path. Keep logical cursor size and hot spots when resampling
