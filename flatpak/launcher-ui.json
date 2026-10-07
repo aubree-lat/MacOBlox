@@ -1,0 +1,349 @@
+{
+  "name": "launcher-ui",
+  "buildsystem": "simple",
+  "build-commands": [
+    "install -m644 /app/lib/x86_64-linux-gnu/girepository-1.0/*.typelib /app/lib/girepository-1.0/"
+  ],
+  "modules": [
+    {
+      "name": "gtk4",
+      "buildsystem": "meson",
+      "config-opts": [
+        "-Dintrospection=enabled",
+        "-Dvulkan=disabled",
+        "-Dbuild-tests=false",
+        "-Dbuild-testsuite=false",
+        "-Dbuild-examples=false",
+        "-Dbuild-demos=false",
+        "-Ddocumentation=false",
+        "-Dman-pages=false",
+        "-Dprint-cups=disabled"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://download.gnome.org/sources/gtk/4.20/gtk-4.20.4.tar.xz",
+          "sha256": "a21f825bd44afc4dd99ba4eea8ff57c8f2e51085cb402a68ed4cbb35299826a4"
+        }
+      ]
+    },
+    {
+      "name": "libfyaml",
+      "buildsystem": "cmake-ninja",
+      "config-opts": [
+        "-DBUILD_TESTING=OFF",
+        "-DENABLE_NETWORK=OFF",
+        "-DENABLE_PORTABLE_TARGET=ON",
+        "-DENABLE_LIBCLANG=OFF"
+      ],
+      "cleanup": [
+        "/bin/fy-*"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/pantoniou/libfyaml/archive/1ed9bae3b1e5fc57e31a14a2ea12810fdf423473.tar.gz",
+          "sha256": "91b7a12cb23f5a9ca75dcca6fc7313bf62360f49d501cc955faa0ad12d6ee25b"
+        }
+      ]
+    },
+    {
+      "name": "libxmlb",
+      "buildsystem": "meson",
+      "config-opts": [
+        "-Dgtkdoc=false",
+        "-Dintrospection=false",
+        "-Dtests=false",
+        "-Dcli=false"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/hughsie/libxmlb/archive/d942cd68a7d78e35b312b9299e69f68f9cd2e503.tar.gz",
+          "sha256": "cd29c5568544678bb968ba15fd9bef3999ac26e42f8cff35fc8db693a9e01333"
+        }
+      ]
+    },
+    {
+      "name": "appstream",
+      "buildsystem": "meson",
+      "config-opts": [
+        "-Dstemming=false",
+        "-Dsystemd=false",
+        "-Dcompose=false",
+        "-Dqt=false",
+        "-Dvapi=false",
+        "-Dgir=false",
+        "-Dtools=false",
+        "-Dbash-completion=false",
+        "-Ddocs=false",
+        "-Dapidocs=false",
+        "-Dinstall-docs=false",
+        "-Dman=false",
+        "-Dblake3-support=false",
+        "-Ddisplay-detection=none"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/ximion/appstream/archive/4e3a4de973810e25bbada1b822185ed4d90eb1f5.tar.gz",
+          "sha256": "fad04889a2c74491d77d01b3a60cd401f3c6ec99d3d9c7d103b72259ad1c6b90"
+        }
+      ]
+    },
+    {
+      "name": "libsass",
+      "buildsystem": "autotools",
+      "config-opts": [
+        "--disable-static",
+        "--disable-tests"
+      ],
+      "cleanup": [
+        "/lib/libsass*"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/sass/libsass/archive/7037f03fabeb2b18b5efa84403f5a6d7a990f460.tar.gz",
+          "sha256": "e0ba129f8619089d773b7848602ddfaf6cd0147dd5651774d05b10d120c23496"
+        },
+        {
+          "type": "shell",
+          "commands": [
+            "printf '%s\\n' '3.6.6' > VERSION",
+            "autoreconf -fi"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sassc",
+      "buildsystem": "autotools",
+      "config-opts": [
+        "--with-libsass=/app"
+      ],
+      "cleanup": [
+        "/bin/sassc"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/sass/sassc/archive/66f0ef37e7f0ad3a65d2f481eff09d09408f42d0.tar.gz",
+          "sha256": "539e97e7d299a4469b9501b4dd6cfcfd4cb025e3c86e57abb192348b63c8d396"
+        },
+        {
+          "type": "shell",
+          "commands": [
+            "printf '%s\\n' '3.6.2' > VERSION",
+            "autoreconf -fi"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "libadwaita",
+      "buildsystem": "meson",
+      "config-opts": [
+        "-Dintrospection=enabled",
+        "-Dtests=false",
+        "-Dexamples=false",
+        "-Dvapi=false",
+        "-Ddocumentation=false"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://download.gnome.org/sources/libadwaita/1.8/libadwaita-1.8.7.tar.xz",
+          "sha256": "db61e9ed0f47a210869d4d36809b1deea140776c58632bdb6704691d7d6e7abb"
+        }
+      ]
+    },
+    {
+      "name": "pycairo",
+      "buildsystem": "meson",
+      "config-opts": [
+        "-Dtests=false"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://files.pythonhosted.org/packages/26/7c/ab4637b028d9ee12280ab9342f28310e613d5ca30c4d72d2aebeaa6a4969/pycairo-1.29.1.tar.gz",
+          "sha256": "4fbd26b4af24c9787d84cf5448e34eb8dca064b732479aaecd03109520eebd5f"
+        }
+      ]
+    },
+    {
+      "name": "pygobject",
+      "buildsystem": "meson",
+      "config-opts": [
+        "-Dtests=false"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://download.gnome.org/sources/pygobject/3.56/pygobject-3.56.3.tar.gz",
+          "sha256": "12760e4a0e3d04b6eb95e06f7a27e362c826d567ea613373a92c003b6c70d2d6"
+        }
+      ]
+    },
+    {
+      "name": "libyaml-build-tool",
+      "buildsystem": "autotools",
+      "config-opts": [
+        "--disable-static"
+      ],
+      "cleanup": [
+        "/lib/libyaml*"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz",
+          "sha256": "c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4"
+        }
+      ]
+    },
+    {
+      "name": "ruby-build-tool",
+      "buildsystem": "autotools",
+      "config-opts": [
+        "--disable-install-doc",
+        "--disable-install-rdoc",
+        "--disable-install-static-library",
+        "--disable-yjit",
+        "--disable-rjit",
+        "--without-gmp"
+      ],
+      "cleanup": [
+        "/bin/ruby",
+        "/bin/gem",
+        "/bin/irb",
+        "/bin/rake",
+        "/bin/rdoc",
+        "/bin/ri",
+        "/lib/ruby",
+        "/lib/libruby*",
+        "/share/ri",
+        "/bin/bundle",
+        "/bin/bundler",
+        "/bin/erb",
+        "/bin/rbs",
+        "/bin/rdbg",
+        "/bin/typeprof"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.8.tar.xz",
+          "sha256": "53a8ec71111449cbbd42224d8d27c493fa6ded228636731051c48604d4255d68"
+        }
+      ]
+    },
+    {
+      "name": "bubblewrap",
+      "buildsystem": "meson",
+      "config-opts": [
+        "-Dtests=false",
+        "-Dman=disabled",
+        "-Dbash_completion=disabled",
+        "-Dzsh_completion=disabled"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/containers/bubblewrap/archive/719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0.tar.gz",
+          "sha256": "e55bdb06f051664ecd3297d449a8b679b7cd1c73adb292b73a81d9b03c5fc462"
+        }
+      ]
+    },
+    {
+      "name": "xdg-dbus-proxy",
+      "buildsystem": "meson",
+      "config-opts": [
+        "-Dtests=false",
+        "-Dinstalled_tests=false",
+        "-Dman=disabled"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/flatpak/xdg-dbus-proxy/archive/72b40c8f6d9d585cfbdb249690724f740d207087.tar.gz",
+          "sha256": "d6c2d37986c93ec966b5fcfe017c29ab687e99813e18c99e11c3aaf6b91ea7a8"
+        }
+      ]
+    },
+    {
+      "name": "unifdef-build-tool",
+      "buildsystem": "simple",
+      "build-commands": [
+        "make",
+        "install -Dm755 unifdef /app/bin/unifdef"
+      ],
+      "cleanup": [
+        "/bin/unifdef"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://dotat.at/prog/unifdef/unifdef-2.12.tar.xz",
+          "sha256": "43ce0f02ecdcdc723b2475575563ddb192e988c886d368260bc0a63aee3ac400"
+        }
+      ],
+      "build-options": {
+        "cflags": "-O2 -g0 -std=gnu11"
+      }
+    },
+    {
+      "name": "webkitgtk",
+      "buildsystem": "cmake-ninja",
+      "build-options": {
+        "cflags": "-O2 -g0",
+        "cxxflags": "-O2 -g0",
+        "env": {
+          "CC": "clang",
+          "CXX": "clang++"
+        },
+        "append-path": "/usr/lib/sdk/llvm22/bin",
+        "prepend-ld-library-path": "/usr/lib/sdk/llvm22/lib"
+      },
+      "config-opts": [
+        "-DPORT=GTK",
+        "-DUSE_GTK4=ON",
+        "-DUSE_VULKAN=OFF",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG",
+        "-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG",
+        "-DENABLE_INTROSPECTION=ON",
+        "-DENABLE_DOCUMENTATION=OFF",
+        "-DENABLE_API_TESTS=OFF",
+        "-DENABLE_LAYOUT_TESTS=OFF",
+        "-DENABLE_MINIBROWSER=OFF",
+        "-DENABLE_WEBDRIVER=OFF",
+        "-DENABLE_GAMEPAD=OFF",
+        "-DENABLE_SPELLCHECK=OFF",
+        "-DENABLE_SPEECH_SYNTHESIS=OFF",
+        "-DUSE_LIBHYPHEN=OFF",
+        "-DUSE_LIBBACKTRACE=OFF",
+        "-DUSE_SYSPROF_CAPTURE=OFF"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://webkitgtk.org/releases/webkitgtk-2.54.1.tar.xz",
+          "sha256": "ea0bbb02dbdbc596874a4e7ad35b66645b3e0a232bd0e4081de5ed92eb0a397d"
+        }
+      ]
+    },
+    {
+      "name": "adwaita-icon-theme",
+      "buildsystem": "meson",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://download.gnome.org/sources/adwaita-icon-theme/50/adwaita-icon-theme-50.0.tar.xz",
+          "sha256": "fac6e0401fca714780561a081b8f7e27c3bc1db34ebda4da175081f26b24d460"
+        }
+      ]
+    }
+  ]
+}

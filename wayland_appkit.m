@@ -1,6 +1,7 @@
 /* AppKit's native Wayland display. Interfaces are declared here because the
  * Darling runtime packages do not include SDK headers. */
 #include "wayland_bridge.h"
+#include "cursor_pixels.h"
 typedef unsigned long NSUInteger;
 typedef long NSInteger;
 typedef signed char BOOL;
@@ -14,6 +15,8 @@ typedef void (*IMP)(void);
 #define YES 1
 #define NO 0
 extern char *getenv(const char *);
+extern void *malloc(unsigned long);
+extern void free(void *);
 extern int strcmp(const char *,const char *);
 extern void *dlsym(void *,const char *);
 extern long write(int,const void *,unsigned long);
@@ -385,7 +388,31 @@ static BOOL subwindow_frame(MacOBloxWaylandWindow *parent,NSRect value,int *x,in
     if(applied==cursor)return;
     [cursor retain];[applied release];applied=cursor;
     if(!cursor->image){api->cursor(0,0,0,0,0,0,[cursor->name UTF8String]);return;}
-    NSSize size=[cursor->image size];if(size.width<1 || size.height<1 || size.width>1024 || size.height>1024)return;
+    NSSize size=[cursor->image size];
+    if(!__builtin_isfinite(size.width) || !__builtin_isfinite(size.height) ||
+       size.width<1 || size.height<1 || size.width>1024 || size.height>1024)return;
+    unsigned long width=(unsigned long)size.width,height=(unsigned long)size.height;
+    unsigned long source_width=0,source_height=0;
+    unsigned int *pixels=macoblox_cursor_pixels_from_image(cursor->image,&source_width,&source_height);
+    if(pixels) {
+        unsigned int *logical=pixels;
+        if(source_width!=width || source_height!=height) {
+            logical=malloc(width*height*4);
+            if(!logical){free(pixels);return;}
+            for(unsigned long row=0;row<height;row++)
+                for(unsigned long column=0;column<width;column++)
+                    logical[row*width+column]=macoblox_cursor_sample_argb(pixels,source_width,source_height,
+                        ((double)column+0.5)*source_width/width-0.5,
+                        ((double)row+0.5)*source_height/height-0.5);
+        }
+        /* Copy the source bitmap directly: Darling's NSImage drawing can
+         * corrupt the channels at translucent cursor edges. Keep the logical
+         * size/hot spot when a representation uses more backing pixels. */
+        api->cursor(logical,width,height,width*4,cursor->hot.x,cursor->hot.y,0);
+        if(logical!=pixels)free(logical);
+        free(pixels);
+        return;
+    }
     const void *color=CGColorSpaceCreateDeviceRGB();void *context=CGBitmapContextCreate(0,size.width,size.height,8,0,color,0x2002);CGColorSpaceRelease(color);if(!context)return;
     [NSGraphicsContext saveGraphicsState];[NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithGraphicsPort:context flipped:NO]];
     [cursor->image drawInRect:(NSRect){{0,0},size} fromRect:(NSRect){{0,0},{0,0}} operation:1 fraction:1];

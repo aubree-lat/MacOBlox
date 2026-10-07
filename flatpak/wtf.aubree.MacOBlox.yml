@@ -1,10 +1,20 @@
 app-id: wtf.aubree.MacOBlox
-runtime: org.gnome.Platform
-runtime-version: '50'
-sdk: org.gnome.Sdk
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.llvm22
 command: macoblox
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/*/pkgconfig
+  - /lib/cmake
+  - /share/gir-1.0
+  - /share/gtk-doc
+  - /share/doc
+  - /share/man
+  - /lib/*.a
 finish-args:
   - --share=network
   - --share=ipc
@@ -16,6 +26,9 @@ finish-args:
   # Roblox asks the GPU driver for VRAM through sysfs (host_vram_bytes).
   - --filesystem=/sys/class/drm:ro
 modules:
+  # Freedesktop supplies the graphics/audio stack. Bundle the launcher UI
+  # libraries instead of inheriting GNOME 50's 25.08 graphics extensions.
+  - launcher-ui.json
   - name: darling
     buildsystem: simple
     build-commands:
@@ -43,6 +56,11 @@ modules:
         -dynamiclib -O2 -o /app/lib/macoblox/launchd_pid1.dylib flatpak/launchd_pid1.c
       - install -d /app/share/macoblox
       - cp -r launcher branding /app/share/macoblox/
+      - rm -rf /app/share/macoblox/branding/source
+      - install -m644 patch_startup_throttle.py /app/share/macoblox/
+      - install -m644 README.md /app/share/macoblox/
+      - install -Dm644 LICENSE /app/share/licenses/macoblox/LICENSE
+      - install -m644 launcher/macoblox/assets/fonts/*-OFL.txt /app/share/licenses/macoblox/
       - rm -f /app/share/macoblox/launcher/install.sh
       - python3 -m compileall -q -d /app/share/macoblox/launcher /app/share/macoblox/launcher
       - install -Dm755 flatpak/macoblox.sh /app/bin/macoblox

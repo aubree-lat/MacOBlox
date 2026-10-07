@@ -19,6 +19,9 @@ struct macoblox_wayland_api {
     void (*action)(unsigned int, int, double, double, const char *);
     int (*poll)(struct macoblox_wayland_event *);
     void (*screen)(int *, int *, double *);
+    /* Custom pixels: premultiplied 0xAARRGGBB words; pitch is bytes per row.
+     * The helper copies them before returning. Dimensions/hot spot are in
+     * logical surface coordinates, matching the existing 1x render buffers. */
     void (*cursor)(const void *, int, int, int, int, int, const char *);
     const char *(*clipboard)(const char *);
     const char *(*error)(void);

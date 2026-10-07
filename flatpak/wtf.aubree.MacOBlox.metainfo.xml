@@ -67,6 +67,16 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.21" date="2026-10-06">
+      <description>
+        <p>Repairs required-update loops across Roblox deployment channels, adds audio playback fallback for older PipeWire versions, and improves cursor positioning during mouse lock. Prevents optional Darling Swift SDK downloads from prompting for Git credentials. The published 0.21 release contains source only; Freedesktop 26.08 packaging remains experimental.</p>
+      </description>
+    </release>
+    <release version="0.20" date="2026-10-05">
+      <description>
+        <p>Repairs keyboard labels used by interaction prompts, compensates mouse coordinates for custom UI scaling, improves camera confinement and text input, and adds GPU selection. Adds crash diagnostics and improves rendering and startup stability. The published 0.20 release contains source only.</p>
+      </description>
+    </release>
     <release version="0.19" date="2026-10-04">
       <description>
         <p>Fixes invisible X11 cursors with Vulkan (Zink), removes unnecessary serialization of independent DNS lookups, and adds adjustable Roblox UI scaling from 100–400%. Improves Flatpak graphics discovery and Vulkan error messages. Repairs experimental Wayland EGL drawables, window lookup and NVIDIA driver discovery. The leave-game pause remains unresolved; Native Wayland and Zink remain experimental. Direct client Vulkan and custom Darlingserver experiments are not included.</p>

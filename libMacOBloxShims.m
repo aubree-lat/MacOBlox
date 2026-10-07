@@ -5,6 +5,7 @@
 #include "x_modifier_state.h"
 #include "dns_concurrency.h"
 #include "cursor_selection.h"
+#include "cursor_pixels.h"
 typedef struct objc_class *Class;
 typedef struct objc_object { Class isa; } *id;
 typedef struct objc_selector *SEL;
@@ -3883,7 +3884,7 @@ extern void CFRelease(const void*);
 // whose compositing corrupts channels of semi-transparent pixels. Returns an
 // Xcursor-style premultiplied ARGB buffer (caller frees), or 0 if the format
 // is not a plain 8-bit RGB(A) layout.
-static unsigned int* macoblox_cursor_pixels_from_image(
+unsigned int* macoblox_cursor_pixels_from_image(
     id image, unsigned long* width_out, unsigned long* height_out) {
     id reps = ((id (*)(id, SEL))objc_msgSend)(image, sel_registerName("representations"));
     unsigned long rep_count = reps
@@ -3976,6 +3977,10 @@ static unsigned int* macoblox_cursor_pixels_from_image(
                 for (int channel = 0; channel < 3; channel++)
                     c[channel] = c[channel] * c[3] / 255;
             }
+            // Even malformed premultiplied images must have transparent RGB
+            // cleared and each color bounded by alpha before compositing.
+            for (int channel = 0; channel < 3; channel++)
+                if (c[channel] > c[3]) c[channel] = c[3];
             pixels[row * width + column] =
                 (c[3] << 24) | (c[0] << 16) | (c[1] << 8) | c[2];
         }

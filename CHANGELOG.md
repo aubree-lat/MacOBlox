@@ -1,5 +1,37 @@
 # Release notes
 
+## Unreleased
+
+- Decode native Wayland custom cursors directly from their source bitmap,
+  sharing the X11 decoder instead of drawing through Darling's image
+  compositing path. Keep logical cursor size and hot spots when resampling
+  larger representations, and clear invalid transparent color channels.
+  Supply straight alpha to SDL and premultiplied alpha to locked-cursor
+  Wayland surfaces, avoiding a second multiplication at translucent edges.
+  The native shim and helper build; the reporting user's appearance still
+  needs confirmation.
+- Move the experimental Flatpak recipe to Freedesktop 26.08, bundling the
+  GTK 4, libadwaita, Adwaita icons, Python bindings and WebKitGTK UI stack.
+  Disable Vulkan rendering in those UI libraries while retaining Roblox's
+  renderer choices.
+  Match graphics and Vulkan layer extensions to the new runtime branch.
+  Include the startup-patch helper missing from the previous Flatpak payload.
+  Normalize WebKit bindings into the standard introspection lookup directory
+  and apply cleanup across the dependency payload. The full experimental
+  Freedesktop build succeeds locally; the reported overlay issue still needs
+  confirmation.
+- Prepare a checksum-pinned 0.21 `macoblox` AUR recipe and update the existing
+  `macoblox-git` recipe. Build the shim and Wayland helper during package
+  creation, include the startup-patch helper and desktop/MIME integration,
+  declare audio and renderer dependencies, and generate `.SRCINFO` files.
+  The stable package builds locally; no AUR submission has been made.
+- Add Debian/Ubuntu packaging and a Fedora/openSUSE RPM spec using a shared
+  payload installer and checksum-pinned release source preparation. Declare
+  distro-specific UI and audio dependencies, prebuild the shim and native
+  helper, and include desktop/MIME integration. Require a separate full
+  Darling package. Debian and RPM source packages build; target-distro binary
+  builds remain unverified.
+
 ## 0.21 — 2026-10-06
 
 - Fix required-update loops when Roblox requests a different deployment

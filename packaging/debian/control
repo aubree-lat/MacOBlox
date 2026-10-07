@@ -1,0 +1,27 @@
+Source: macoblox
+Section: games
+Priority: optional
+Maintainer: MacOBlox maintainers <noreply@aubree.wtf>
+Build-Depends: debhelper-compat (= 13), dh-python, python3, clang, lld,
+ pkg-config, libsdl2-dev, libwayland-dev, darling
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/aubree-lat/MacOBlox
+Vcs-Git: https://github.com/aubree-lat/MacOBlox.git
+Vcs-Browser: https://github.com/aubree-lat/MacOBlox
+
+Package: macoblox
+Architecture: amd64
+Depends: ${misc:Depends}, ${shlibs:Depends}, ${python3:Depends}, darling,
+ unzip, python3-gi, python3-gi-cairo, python3-cairo,
+ gir1.2-gtk-4.0 (>= 4.14), gir1.2-adw-1 (>= 1.5), gir1.2-webkit-6.0,
+ pulseaudio-utils, libegl1, libx11-6, libxext6, libxfixes3, libxi6, libxcursor1,
+ hicolor-icon-theme, shared-mime-info, desktop-file-utils
+Recommends: pipewire-bin
+Suggests: mangohud, mesa-vulkan-drivers, libvulkan1
+Description: Run the macOS Roblox client on Linux through Darling
+ Mac O' Blox provides a GTK launcher and compatibility shims for the macOS
+ Roblox player. The package includes prebuilt shims, desktop shortcuts and
+ Roblox link handlers. Roblox itself is downloaded on first setup.
+ .
+ A full Darling installation, including GUI frameworks and stubs, is required.

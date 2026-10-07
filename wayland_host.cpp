@@ -2,6 +2,7 @@
  * into Darwin. Rendering uses the wl_egl_window directly, with no game
  * framebuffer readback and no X11 connection. */
 #include "wayland_bridge.h"
+#include "cursor_pixels.h"
 #include <SDL.h>
 #include <SDL_syswm.h>
 #include <wayland-client.h>
@@ -439,7 +440,16 @@ void cursor(const void *pixels,int width,int height,int pitch,int hot_x,int hot_
     enqueue([=]{
         SDL_Cursor *next=nullptr;
         if(!copy.empty()) {
-            auto bitmap=SDL_CreateRGBSurfaceWithFormatFrom((void*)copy.data(),width,height,32,width*4,SDL_PIXELFORMAT_ARGB8888);
+            /* SDL's Wayland backend premultiplies its input. Supply straight
+             * alpha there; the locked-cursor SHM buffer keeps premultiplied
+             * alpha, avoiding a second multiplication at soft edges. */
+            std::vector<unsigned char> straight(copy.size());
+            for(size_t offset=0;offset<copy.size();offset+=4) {
+                unsigned int pixel;std::memcpy(&pixel,copy.data()+offset,4);
+                pixel=macoblox_cursor_straight_argb(pixel);
+                std::memcpy(straight.data()+offset,&pixel,4);
+            }
+            auto bitmap=SDL_CreateRGBSurfaceWithFormatFrom(straight.data(),width,height,32,width*4,SDL_PIXELFORMAT_ARGB8888);
             if(bitmap){next=SDL_CreateColorCursor(bitmap,std::clamp(hot_x,0,width-1),std::clamp(hot_y,0,height-1));SDL_FreeSurface(bitmap);}
             custom_cursor_surface(copy,width,height,std::clamp(hot_x,0,width-1),std::clamp(hot_y,0,height-1));
         } else {

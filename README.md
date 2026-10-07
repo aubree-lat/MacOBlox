@@ -43,6 +43,16 @@ are options too:
 curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash -s -- --uninstall
 ```
 
+Arch package recipes for the stable `macoblox` release and `macoblox-git` are
+in [packaging/aur](packaging/aur/README.md). They build the shim at package
+creation and install system menu entries. The stable recipe is prepared for
+AUR submission; `macoblox-git` already has an AUR listing.
+
+[Native distro packaging](packaging/README.md) also includes a Debian/Ubuntu
+overlay and a Fedora/openSUSE RPM spec, with pinned source preparation and
+build instructions. These recipes require a full Darling package and have
+not yet been built in their target distros.
+
 Installer and launcher updates exclude `website/` and its hosting configuration.
 
 Uninstalling keeps Darling and its prefix, `~/.darling`, which holds your Roblox
@@ -172,7 +182,8 @@ It works with both OpenGL and Vulkan (Zink) and is off by default. You can also
 start the source launcher with `MANGOHUD=1 ./launcher/macoblox-launcher`.
 The launcher also forwards `MANGOHUD_CONFIG` and `MANGOHUD_CONFIGFILE` to Roblox.
 For the Flatpak, install the matching MangoHud extension with
-`flatpak install flathub org.freedesktop.Platform.VulkanLayer.MangoHud//25.08`.
+`flatpak install flathub org.freedesktop.Platform.VulkanLayer.MangoHud//26.08`
+for the current experimental recipe. The older 0.19 bundle uses `//25.08`.
 </details>
 
 <details>
@@ -307,10 +318,15 @@ flatpak install --user MacOBlox-0.19-x86_64.flatpak
 ```
 
 It keeps its own Darling prefix, so sign in to Roblox again there. Roblox Studio
-is not in the Flatpak yet. To build it yourself:
+is not in the Flatpak yet. The current experimental recipe uses Freedesktop
+26.08 and bundles GTK 4, libadwaita, Adwaita icons, PyGObject and WebKitGTK.
+Vulkan rendering is disabled in the UI libraries; Roblox keeps its renderer
+setting. Graphics drivers and Vulkan layer extensions must match 26.08.
+Building the UI libraries, especially WebKitGTK, takes considerably longer
+than the previous GNOME runtime recipe. To build it yourself:
 
 ```bash
-flatpak install --user flathub org.flatpak.Builder org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.llvm22//25.08
+flatpak install --user flathub org.flatpak.Builder org.freedesktop.Platform//26.08 org.freedesktop.Sdk//26.08 org.freedesktop.Sdk.Extension.llvm22//26.08
 cd MacOBlox/flatpak
 flatpak run --env=FLATPAK_USER_DIR=$HOME/.local/share/flatpak --command=flatpak-builder org.flatpak.Builder --user --install --force-clean build-dir wtf.aubree.MacOBlox.yml
 ```

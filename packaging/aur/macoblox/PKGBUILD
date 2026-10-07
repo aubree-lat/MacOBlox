@@ -1,40 +1,32 @@
 # Maintainer: aubree.wtf <https://aubree.wtf/>
-pkgname=macoblox-git
-_name=MacOBlox
-pkgver=0.21.r0.gc8c5648
+pkgname=macoblox
+pkgver=0.21
 pkgrel=1
-pkgdesc="Run the macOS Roblox client on Linux through Darling"
+pkgdesc='Run the macOS Roblox client on Linux through Darling'
 arch=('x86_64')
-url="https://github.com/aubree-lat/MacOBlox"
+url='https://github.com/aubree-lat/MacOBlox'
 license=('MIT' 'OFL-1.1')
 depends=('darling' 'unzip' 'python' 'python-gobject' 'python-cairo'
          'gtk4>=4.14' 'libadwaita>=1.5' 'webkitgtk-6.0' 'sdl2' 'wayland'
          'libpulse' 'libglvnd' 'libx11' 'libxext' 'libxfixes' 'libxi' 'libxcursor' 'gcc-libs')
 depends+=('hicolor-icon-theme' 'shared-mime-info' 'desktop-file-utils')
-makedepends=('git' 'clang' 'lld' 'pkgconf')
+makedepends=('clang' 'lld' 'pkgconf')
 optdepends=('mangohud: performance overlay'
             'mesa: Mesa EGL and Zink for the Vulkan renderer'
             'vulkan-icd-loader: Vulkan renderer loader'
             'vulkan-driver: hardware Vulkan driver for the Vulkan renderer'
             'pipewire-audio: native PipeWire audio playback')
-provides=('macoblox')
-conflicts=('macoblox')
-source=("$_name::git+$url.git")
-sha256sums=('SKIP')
-
-pkgver() {
-  cd "$_name"
-  git describe --tags --long --match 'v[0-9]*' --abbrev=7 |
-    sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
-}
+conflicts=('macoblox-git')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('d269a2fe5e77f6d9dfe6f9ad1281044aecb6affb868cbd9478e9efb37c21450e')
 
 build() {
-  cd "$_name"
+  cd "MacOBlox-$pkgver"
   MACOBLOX_BUILD_DIR="$srcdir/native-build" ./build_debug_shim.sh
 }
 
 package() {
-  cd "$_name"
+  cd "MacOBlox-$pkgver"
   local share="$pkgdir/usr/share/macoblox"
   install -d "$share/branding"
   cp -r --no-preserve=ownership launcher "$share/"

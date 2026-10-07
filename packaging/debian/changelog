@@ -1,0 +1,6 @@
+macoblox (0.21-1) unstable; urgency=medium
+
+  * Initial Debian package with prebuilt compatibility shims and desktop
+    integration. Download Roblox on first launch.
+
+ -- MacOBlox maintainers <noreply@aubree.wtf>  Tue, 06 Oct 2026 21:00:00 -0500
