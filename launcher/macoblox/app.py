@@ -127,6 +127,7 @@ class GameLogsView(Gtk.Box):
         self._search_refresh_id = 0
         self._search_limited = False
         self._search_query = ""
+        self._server_poll_id = 0
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         bar.set_margin_start(16)
@@ -138,6 +139,9 @@ class GameLogsView(Gtk.Box):
 
         self.status_label = Gtk.Label(css_classes=["dim-label", "caption"], margin_start=8)
         bar.append(self.status_label)
+        self.server_label = Gtk.Label(css_classes=["dim-label", "caption"], margin_start=8)
+        self.server_label.set_visible(False)
+        bar.append(self.server_label)
 
         spacer = Gtk.Box(hexpand=True)
         bar.append(spacer)
@@ -403,6 +407,37 @@ class GameLogsView(Gtk.Box):
                 else:
                     self.buffer.insert(end, line + "\n")
 
+    def _refresh_server_location(self):
+        if not self.window.settings.get("show_server_location", True):
+            self.server_label.set_visible(False)
+            self._server_poll_id = 0
+            return False
+        ip, location = core.detect_server_location()
+        if location:
+            self.server_label.set_text(f"🌍 {location}")
+            self.server_label.set_visible(True)
+        elif ip:
+            self.server_label.set_text(f"🌍 {ip}")
+            self.server_label.set_visible(True)
+        else:
+            self.server_label.set_text("")
+            self.server_label.set_visible(False)
+        return True
+
+    def start_server_location_polling(self):
+        if self._server_poll_id:
+            return
+        if not self.window.settings.get("show_server_location", True):
+            return
+        self._server_poll_id = GLib.timeout_add_seconds(10, self._refresh_server_location)
+        self._refresh_server_location()
+
+    def stop_server_location_polling(self):
+        if self._server_poll_id:
+            GLib.source_remove(self._server_poll_id)
+            self._server_poll_id = 0
+
+
     def reset(self, log_path=None):
         if self._drain_id:
             GLib.source_remove(self._drain_id)
@@ -417,8 +452,10 @@ class GameLogsView(Gtk.Box):
         self.close_search()
         if log_path:
             self.status_label.set_text(log_path.name)
+            self.start_server_location_polling()
         else:
             self.status_label.set_text("")
+            self.stop_server_location_polling()
 
     def update(self):
         log_path = None
@@ -428,6 +465,7 @@ class GameLogsView(Gtk.Box):
             log_path = self.window.last_log
 
         if not log_path or not log_path.exists():
+            self.stop_server_location_polling()
             return
 
         if self.current_log_path != log_path:

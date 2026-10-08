@@ -111,6 +111,7 @@ DEFAULT_SETTINGS = {
     "framerate_cap": 0,
     "hide_launcher_on_launch": True,
     "show_playtime": True,
+    "show_server_location": True,
     "playtime_seconds": 0,
     "discord_rpc": True,
     "discord_rpc_game": True,
@@ -2201,3 +2202,73 @@ class RobloxSession:
         if self.audio:
             self.audio.stop()
             self.audio = None
+
+
+SERVER_IP_PATTERN = re.compile(
+    r'Connection accepted from\s+(\d{1,3}(?:\.\d{1,3}){3})'
+)
+
+_server_location_cache = {}
+
+
+def _latest_roblox_log():
+    """Return the newest Roblox Player log file inside the Darling prefix."""
+    candidates_dirs = [
+        Path.home() / ".darling" / "Users" / os.environ.get("USER", "") / "Library" / "Logs" / "Roblox",
+        LOGS,
+    ]
+    for log_dir in candidates_dirs:
+        if not log_dir.is_dir():
+            continue
+        logs = sorted(
+            [p for p in log_dir.glob("*_Player_*.log") if "CrashHandler" not in p.name],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if logs:
+            return logs[0]
+    return None
+
+
+def extract_server_ip(log_path=None):
+    """Read the latest Roblox log and extract the connected server IP."""
+    if log_path is None:
+        log_path = _latest_roblox_log()
+    if not log_path or not Path(log_path).is_file():
+        return None
+    try:
+        text = Path(log_path).read_text(errors="replace")
+    except OSError:
+        return None
+    matches = SERVER_IP_PATTERN.findall(text)
+    return matches[-1] if matches else None
+
+
+def query_server_location(ip_address):
+    """Query the RoValra API for the geolocation of a server IP."""
+    if not ip_address:
+        return None
+    if ip_address in _server_location_cache:
+        return _server_location_cache[ip_address]
+    url = f"https://apis.rovalra.com/v1/geolocation?ip={ip_address}"
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "MacOBlox"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode())
+    except Exception as e:
+        logging.getLogger("macoblox").warning("RoValra query failed: %s", e)
+        return None
+    location = data.get("location", {})
+    parts = [location.get("city"), location.get("region"), location.get("country")]
+    parts = [p for p in parts if p]
+    result = ", ".join(parts) if parts else None
+    _server_location_cache[ip_address] = result
+    return result
+
+
+def detect_server_location():
+    """Extract the current server IP and query its geolocation."""
+    ip = extract_server_ip()
+    if not ip:
+        return None, None
+    return ip, query_server_location(ip)
